@@ -73,16 +73,40 @@ def state(tello):
     return {k: s.get(k) for k in keys}
 
 
-def new_frames(reader, seconds):
-    """Count new decoded frames for `seconds`; return (count, last frame)."""
-    previous, count, last = reader.frame, 0, None
+DOWN_SHAPE = (240, 320)   # the downward camera stream
+
+
+def corrupted_fraction(frame):
+    """Share of 'coloured' pixels. The downward camera is monochrome (R=G=B), so
+    green/purple blocks are H.264 decoding errors (lost video packets)."""
+    if frame.ndim != 3:
+        return 0.0
+    f = frame.astype("int16")
+    r, g, b = f[..., 0], f[..., 1], f[..., 2]
+    return float(((abs(g - r) > 40) | (abs(g - b) > 40)).mean())
+
+
+def new_frames(reader, seconds, check=None):
+    """Count new decoded frames for `seconds`.
+
+    Returns (count, last frame, last frame passing check, frames failing check).
+    """
+    previous, count, last, good, bad = reader.frame, 0, None, None, 0
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         frame = reader.frame
         if frame is not None and frame is not previous and getattr(frame, "size", 0):
             count, previous, last = count + 1, frame, frame
+            if check is None or check(frame):
+                good = frame
+            else:
+                bad += 1
         time.sleep(0.005)
-    return count, last
+    return count, last, good, bad
+
+
+def healthy_down(frame):
+    return frame.shape[:2] == DOWN_SHAPE and corrupted_fraction(frame) < 0.01
 
 
 def save(name, frame):
@@ -107,29 +131,48 @@ def cmd_info(tello, args):
     print("Toestand:", json.dumps(state(tello)))
 
 
-def start_video(tello):
-    tello.streamon()
-    reader = tello.get_frame_read()
-    count, frame = new_frames(reader, 2.0)
-    if frame is None:
-        raise RuntimeError("geen videobeelden ontvangen (UDP 11111, firewall?)")
-    return reader
+def start_video(tello, attempts=3):
+    """Start the stream; over STA the decoder often fails to start, so retry."""
+    for attempt in range(1, attempts + 1):
+        try:
+            tello.streamon()
+            reader = tello.get_frame_read()
+            count, frame, _, _ = new_frames(reader, 2.0)
+            if frame is not None:
+                if attempt > 1:
+                    print(f"ℹ️  video gestart bij poging {attempt}")
+                return reader
+            print(f"ℹ️  poging {attempt}: geen beelden")
+        except Exception as e:
+            print(f"ℹ️  poging {attempt}: {e}")
+        if tello.background_frame_read is not None:
+            tello.background_frame_read.stop()
+            tello.background_frame_read = None
+        try:
+            tello.streamoff()
+        except Exception:
+            pass
+        time.sleep(1.0)
+    raise RuntimeError(f"video na {attempts} pogingen niet gestart (UDP 11111, Wi-Fi-kwaliteit?)")
 
 
 def cmd_video(tello, args):
     reader = start_video(tello)
     print("Downvision 0:", tello.send_command_with_return("downvision 0", timeout=3))
     time.sleep(1.0)
-    count, frame = new_frames(reader, 3.0)
+    count, frame, _, _ = new_frames(reader, 3.0)
     if frame is not None:
         print(f"Voorcamera: {frame.shape[1]}x{frame.shape[0]}, {count / 3:.1f} fps -> {save('front.png', frame)}")
     else:
         print("Voorcamera: geen beelden")
     print("Downvision 1:", tello.send_command_with_return("downvision 1", timeout=3))
     time.sleep(1.5)
-    count, frame = new_frames(reader, 3.0)
+    seconds = args.seconds if args.seconds != 15 else 10
+    count, frame, good, bad = new_frames(reader, seconds, healthy_down)
     if frame is not None:
-        print(f"Ondercamera: {frame.shape[1]}x{frame.shape[0]}, {count / 3:.1f} fps -> {save('down.png', frame)}")
+        print(f"Ondercamera: {frame.shape[1]}x{frame.shape[0]}, {count / seconds:.1f} fps, "
+              f"{bad}/{count} beelden beschadigd of verkeerd formaat ({100 * bad / count:.0f}%)")
+        print("  laatste gezonde beeld ->", save("down.png", good) if good is not None else "geen")
     else:
         print("Ondercamera: geen beelden")
 
@@ -141,9 +184,11 @@ def cmd_snap(tello, args):
     reader = start_video(tello)
     print("Downvision 1:", tello.send_command_with_return("downvision 1", timeout=3))
     time.sleep(1.5)
-    _, frame = new_frames(reader, 1.0)
+    _, _, frame, bad = new_frames(reader, 2.0, healthy_down)
     if frame is None:
-        raise RuntimeError("geen beeld van de ondercamera")
+        raise RuntimeError(f"geen gezond beeld van de ondercamera ({bad} beschadigd/verkeerd formaat)")
+    if bad:
+        print(f"ℹ️  {bad} beschadigde beelden overgeslagen")
     s = state(tello)
     cam = DownCam()
     gray = cam.prepare(frame.copy())
