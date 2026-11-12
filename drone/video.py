@@ -23,11 +23,26 @@ NO_STA_VIDEO = ("STA sans caméra inférieure confirmée : odométrie visuelle, 
                 "revenir en AP pour les fonctions visuelles.")
 
 
+def front_camera_first(tello):
+    """Select the front camera before the video stream starts.
+
+    Ground test 2026-11-12: a stream started while the drone was still on the
+    downward camera (left from an earlier session) decoded only as corrupted
+    320x720 frames; starting on the front camera and then switching gave clean
+    320x240 frames. A failure here is not fatal: the caller still switches later.
+    """
+    try:
+        return str(tello.send_command_with_return("downvision 0", timeout=3)).strip().lower() == "ok"
+    except Exception:
+        return False
+
+
 def station_video(tello, enabled=False):
     if not enabled:
         return VideoCapability(False, False, NoVideoReader(), NO_STA_VIDEO)
     reader = None
     started = False
+    front_camera_first(tello)
     try:
         response = tello.send_command_with_return("streamon", timeout=3)
         if str(response).strip().lower() != "ok":

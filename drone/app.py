@@ -35,7 +35,7 @@ from .pad_recovery import PadRecovery
 from .pathline import PathDetector, draw_path, to_body
 from .puddles import PuddleDetector, draw_puddles
 from .telemetry import Telemetry
-from .video import station_video
+from .video import front_camera_first, station_video
 
 
 class CommandRejected(Exception):
@@ -137,6 +137,8 @@ class DroneApp:
                 self.pose.position_valid = False
                 self.recording = False
         else:
+            front_camera_first(self.tello)   # a stream started on the downward camera is garbage
+            self.downvision_enabled = False
             self.tello.streamon()
             self.set_downvision(True)
             self.frame_reader = self.tello.get_frame_read()

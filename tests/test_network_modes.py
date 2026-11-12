@@ -178,7 +178,8 @@ class VideoProbeTests(unittest.TestCase):
 
         reader = Reader()
         tello = Mock()
-        tello.send_command_with_return.side_effect = list(replies) + ["ok"]
+        # first reply: front_camera_first() ("downvision 0") before streamon
+        tello.send_command_with_return.side_effect = ["ok"] + list(replies) + ["ok"]
         tello.get_frame_read.return_value = reader
         with patch("drone.video.time.monotonic", clock.monotonic), \
              patch("drone.video.time.sleep", clock.sleep), \
@@ -205,6 +206,21 @@ class VideoProbeTests(unittest.TestCase):
         self.assertTrue(result.downward)
         self.assertEqual(result.warning, "")
         reader.stop.assert_not_called()
+
+    def test_stream_starts_on_the_front_camera_then_switches_down(self):
+        _, tello, _ = self.probe([np.ones((20, 20, 3)) for _ in range(3)])
+        sent = [c.args[0] for c in tello.send_command_with_return.call_args_list]
+        self.assertEqual(sent[:3], ["downvision 0", "streamon", "downvision 1"])
+
+    def test_front_camera_request_failure_does_not_block_video(self):
+        tello = Mock()
+        tello.send_command_with_return.side_effect = [RuntimeError("timeout"), "ok", "ok"]
+        reader = Mock()
+        reader.frame = None
+        frames = iter([np.ones((2, 2, 3)) for _ in range(3)])
+        type(reader).frame = property(lambda self: next(frames, None))
+        tello.get_frame_read.return_value = reader
+        self.assertTrue(station_video(tello, True).available)
 
     def test_front_video_does_not_enable_downward_navigation(self):
         result, _, _ = self.probe([np.ones((20, 20, 3)) for _ in range(3)], ("ok", "error"))
@@ -254,7 +270,11 @@ class ApplicationCapabilityTests(unittest.TestCase):
              patch("drone.app.station_video") as probe:
             app.start()
             app.tello.streamon.assert_called_once()
-            app.tello.send_command_with_return.assert_called_once_with("downvision 1")
+            # front camera before the stream starts, downward camera after
+            self.assertEqual(app.tello.send_command_with_return.call_args_list,
+                             [call("downvision 0", timeout=3), call("downvision 1")])
+            names = [c[0] for c in app.tello.mock_calls]
+            self.assertLess(names.index("send_command_with_return"), names.index("streamon"))
             app.tello.get_frame_read.assert_called_once()
             odometry.assert_called_once()
             self.assertIn(app.detect_loop, [item.kwargs["target"] for item in thread.call_args_list])

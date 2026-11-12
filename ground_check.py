@@ -181,10 +181,16 @@ def cmd_snap(tello, args):
     from drone.downcam import DownCam, cm_per_pixel, pixel_to_world
     from drone.helipad import HelipadDetector, draw_helipad
 
+    # Start on the front camera, then switch: a stream started while the drone is
+    # already on the downward camera decoded as garbage (320x720) in the tests.
+    print("Downvision 0:", tello.send_command_with_return("downvision 0", timeout=3))
     reader = start_video(tello)
     print("Downvision 1:", tello.send_command_with_return("downvision 1", timeout=3))
     time.sleep(1.5)
-    _, _, frame, bad = new_frames(reader, 2.0, healthy_down)
+    _, last, frame, bad = new_frames(reader, 2.0, healthy_down)
+    if frame is None and last is not None:
+        print(f"ℹ️  laatste beeld: {last.shape[1]}x{last.shape[0]}, "
+              f"{100 * corrupted_fraction(last):.0f}% gekleurd -> {save(f'down_{args.name}_bad.png', last)}")
     if frame is None:
         raise RuntimeError(f"geen gezond beeld van de ondercamera ({bad} beschadigd/verkeerd formaat)")
     if bad:
