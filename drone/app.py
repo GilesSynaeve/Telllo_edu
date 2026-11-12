@@ -702,6 +702,7 @@ class DroneApp:
                         (x0, y0, height), max_speed=12, gain=0.8, damping=0.4,
                         tolerance_cm=3, timeout_s=3, max_vertical_speed=0,
                         max_error_growth_cm=4)
+                    self.save_hold_trace("takeoff_recenter")
                     if not arrived:
                         print("⚠️  Startplek niet bereikt: correctie gestopt. "
                               "Controleer camerakalibratie als de drone de verkeerde kant op corrigeert.")
@@ -1520,6 +1521,25 @@ class DroneApp:
                 pass
         self.link.close()
         print("Drone landed and disconnected")
+
+    def save_hold_trace(self, label):
+        """Keep the last precise-positioning run (target, measured xyz and the commanded
+        velocity per control step) as JSON for flight analysis. Never raises."""
+        result = getattr(getattr(self, "follower", None), "last_hold_result", None)
+        if not isinstance(result, dict):
+            return None
+        try:
+            folder = os.path.join(cfg.TELEMETRY_LOG_DIR, "holds")
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, time.strftime(f"%Y%m%d_%H%M%S_{label}.json"))
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(dict(result, label=label, saved_at=time.time(),
+                               columns=["t_s", "x", "y", "z", "vx_cmd", "vy_cmd", "vz_cmd"]),
+                          stream, indent=1, default=str)
+            return path
+        except Exception as e:
+            print(f"⚠️  Positioneerlog niet bewaard: {e}")
+            return None
 
     def save_telemetry(self):
         """Write the whole session's telemetry to one CSV (overwritten with the full

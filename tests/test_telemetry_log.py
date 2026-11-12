@@ -49,6 +49,22 @@ class TelemetryLogTests(unittest.TestCase):
         app.telemetry.export_csv.side_effect = OSError("disk full")
         self.assertIsNone(app.save_telemetry())
 
+    def test_hold_trace_is_saved_as_json(self):
+        import json
+        app = self.make_app()
+        app.follower.last_hold_result = {"target_cm": (0, 0, 80), "reason": "timeout",
+                                         "trace": [[0.0, 5.0, 1.0, 80.0, -4.0, -0.8, 0.0]]}
+        with tempfile.TemporaryDirectory() as folder, \
+                patch("drone.app.cfg.TELEMETRY_LOG_DIR", folder):
+            path = app.save_hold_trace("takeoff_recenter")
+            with open(path, encoding="utf-8") as stream:
+                saved = json.load(stream)
+        self.assertEqual(saved["label"], "takeoff_recenter")
+        self.assertEqual(saved["trace"][0][4], -4.0)
+        self.assertIn("vx_cmd", saved["columns"])
+        app.follower.last_hold_result = None
+        self.assertIsNone(app.save_hold_trace("x"))
+
     def test_position_valid_is_exported(self):
         self.assertIn("position_valid", FIELDS)
 
