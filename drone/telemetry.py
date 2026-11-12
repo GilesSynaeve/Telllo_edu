@@ -154,10 +154,11 @@ def cluster(cells, cell_cm):
 class Telemetry:
     """Samples all Tello sensors in a background thread."""
 
-    def __init__(self, tello, pose, is_airborne, hz=None, history_s=None):
+    def __init__(self, tello, pose, is_airborne, hz=None, history_s=None, sensor_only=False):
         self.tello = tello
         self.pose = pose
         self.is_airborne = is_airborne
+        self.sensor_only = sensor_only
         self.hz = hz or cfg.TELEMETRY_HZ
         self.samples = deque(maxlen=int((history_s or cfg.TELEMETRY_HISTORY_S) * self.hz))
         self.terrain = TerrainMap()
@@ -182,6 +183,13 @@ class Telemetry:
         tof = _num(s.get("tof"))
         if tof is not None and not cfg.TOF_MIN_CM < tof < cfg.TOF_MAX_CM:
             tof = None                       # 10 = too close / no reading
+        if getattr(self, "sensor_only", False):
+            yaw = _num(s.get("yaw"))
+            if yaw is not None:
+                self.pose.update_imu(yaw)
+            self.pose.step(dt, now, height=tof if airborne else 0, measured=False)
+            self.pose.position_valid = self.pose.local_reference_valid = False
+            x, y, z, yaw = self.pose.get()
         baro = _num(s.get("baro"))
         baro = baro * 100 if baro is not None else None      # m -> cm
         h = _num(s.get("h"))

@@ -542,8 +542,11 @@ class PathFollower:
     def hold_position(self, target, max_speed=20.0, gain=None,
                       tolerance_cm=None, timeout_s=None, settle_s=0.0,
                       allow_local_reference=False, damping=0.0, max_vertical_speed=None,
-                      max_error_growth_cm=15):
-        """Precise positioning on a waypoint with small rc corrections."""
+                      max_error_growth_cm=15, z_tolerance_cm=None):
+        """Precise positioning on a waypoint with small rc corrections.
+
+        z_tolerance_cm: separate altitude band (default: derived from tolerance_cm).
+        """
         def reference_valid():
             return self.pose.position_valid or (allow_local_reference and self.pose.local_reference_valid)
 
@@ -559,6 +562,8 @@ class PathFollower:
         deadline = t0 + timeout_s
         tolerance = cfg.FINE_TOL_CM if tolerance_cm is None else tolerance_cm
         z_tolerance = 1.5 * tolerance if tolerance_cm is None else tolerance
+        if z_tolerance_cm is not None:
+            z_tolerance = z_tolerance_cm
         # A noisy derivative must not reject a position that stays inside the
         # band for the full settling period. Still reject fast crossings.
         settle_speed = max(3.0, min(6.0, tolerance / max(settle_s, 0.5)))

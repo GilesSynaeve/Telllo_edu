@@ -39,6 +39,8 @@ from drone import config as cfg  # noqa: E402
 from drone.app import DroneApp  # noqa: E402
 from drone.navigator import validate_waypoints  # noqa: E402
 from gui import theme  # noqa: E402
+from gui.connection_dialog import AP_RESET_HELP, choose_connection  # noqa: E402
+from drone.network import ConnectionOptions  # noqa: E402
 from gui.tracking import TrajectoryHistory, display_tracking, flip_readiness  # noqa: E402
 from gui.map3d import VIEWS, Map3D, legend  # noqa: E402
 from gui.mapview import MapView  # noqa: E402
@@ -115,6 +117,10 @@ class TelloGUI:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self._build_topbar()
+        if getattr(app, "network_mode", "ap") == "sta":
+            text = f"STA · {app.tello.address[0]} · " + (app.video_warning or "Vidéo inférieure reçue et confirmée")
+            tk.Label(root, text=text, bg=C["bg"], fg=C["warn"] if app.video_warning else C["ok"],
+                     wraplength=1180, anchor="w", justify="left").pack(fill=tk.X, padx=10, pady=(0, 6))
         body = ttk.Frame(root, style="Bg.TFrame")
         body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
         body.columnconfigure(1, weight=1)
@@ -130,6 +136,7 @@ class TelloGUI:
         self._build_left(left)
         self._build_center(center)
         self._build_right(right)
+        self._apply_capabilities()
         self._bind_keys()
         self._validate_entries()
         self.toast.show("Klik op de kaart om punten toe te voegen, of vul x, y, z in.", "info", 8)
@@ -171,14 +178,19 @@ class TelloGUI:
         outer.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
         grid = ttk.Frame(box, style="Card.TFrame")
         grid.pack(fill=tk.X)
+        self.vision_buttons = []
         for text, cmd, color, r, c in (
                 ("▶  Start missie", self.start_mission, "#238453", 0, 0),
                 ("Ga naar punt", self.goto_selected, "#1f6fb5", 0, 1),
                 ("Opstijgen", lambda: self.app.submit({"type": "takeoff"}), "#3a4757", 1, 0),
             ("Landen  (L)", self.land, "#c2701b", 1, 1)):
-            tk_button(grid, text, cmd, color).grid(row=r, column=c, sticky="ew", padx=2, pady=2)
-        tk_button(grid, "Landen op de H  (H)", self.helipad_land, "#2f7d6d").grid(
-            row=2, column=0, sticky="ew", padx=2, pady=2)
+            button = tk_button(grid, text, cmd, color)
+            button.grid(row=r, column=c, sticky="ew", padx=2, pady=2)
+            if r == 0:
+                self.vision_buttons.append(button)
+        button = tk_button(grid, "Landen op de H  (H)", self.helipad_land, "#2f7d6d")
+        button.grid(row=2, column=0, sticky="ew", padx=2, pady=2)
+        self.vision_buttons.append(button)
         tk_button(grid, "↺  Reset omgeving", self.reset_environment, "#5a4a8a").grid(
             row=2, column=1, sticky="ew", padx=2, pady=2)
         # Salto button: request a flip via the mission thread
@@ -400,7 +412,8 @@ class TelloGUI:
         row = ttk.Frame(box, style="Card.TFrame")
         row.pack(fill=tk.X, pady=(6, 0))
         self.show_dets = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row, text="Detecties tonen", variable=self.show_dets).pack(side=tk.LEFT)
+        self.detect_check = ttk.Checkbutton(row, text="Detecties tonen", variable=self.show_dets)
+        self.detect_check.pack(side=tk.LEFT)
         self.record_btn = ttk.Button(row, text="● Opnemen (dataset)", style="Small.TButton",
                                      command=self.toggle_record)
         self.record_btn.pack(side=tk.RIGHT)
@@ -436,6 +449,12 @@ class TelloGUI:
                                   wraplength=330)
         self.pad_info.pack(anchor=tk.W, fill=tk.X)
         self._pad_text = None
+
+    def _apply_capabilities(self):
+        if not getattr(self.app, "vision_navigation_available", True):
+            for button in self.vision_buttons + [self.record_btn, self.detect_check] + list(self.cam_seg.buttons.values()):
+                button.configure(state=tk.DISABLED)
+            self.show_dets.set(False)
 
     def _bind_keys(self):
         # Sneltoetsen voor veelgebruikte acties tijdens plannen en vliegen.
@@ -722,8 +741,10 @@ class TelloGUI:
         vis = app.latest_vis() if (self.show_dets.get() and app.downvision_enabled) else None
         self.cam.delete("all")
         if frame is None and vis is None:
-            self.cam.create_text(self.cam_w / 2, self.cam_h / 2, text="Geen camerabeeld",
-                                 fill=C["muted"], font=F["base"])
+            message = ("STA : vidéo indisponible\nNavigation visuelle désactivée\nRevenir en AP pour les caméras"
+                       if not getattr(app, "video_available", True) else "Geen camerabeeld")
+            self.cam.create_text(self.cam_w / 2, self.cam_h / 2, text=message,
+                                 fill=C["muted"], font=F["base"], width=self.cam_w - 16)
             return
         if vis is not None:
             img = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
@@ -762,6 +783,9 @@ class TelloGUI:
 
     # ================================================================ camera
     def set_camera_mode(self, use_downvision):
+        if not getattr(self.app, "vision_navigation_available", True):
+            self.toast.show(self.app.video_warning, "warn", 6)
+            return
         # Schakel tussen voor- en ondercamera via de mission queue.
         # via the mission thread: only one thread may talk to the Tello at a time
         self._cam_pending = bool(use_downvision)
@@ -771,6 +795,9 @@ class TelloGUI:
                             "opdracht.", "info")
 
     def toggle_record(self):
+        if not getattr(self.app, "vision_navigation_available", True):
+            self.toast.show(self.app.video_warning, "warn", 6)
+            return
         # Start of stop het verzamelen van cameraframes voor een dataset.
         self.app.toggle_recording()
         self.record_btn.configure(text="■ Stop opnemen" if self.app.recording
@@ -778,6 +805,8 @@ class TelloGUI:
 
     def _flip_availability(self):
         app = self.app
+        if not getattr(app, "vision_navigation_available", True):
+            return False, "Salto · caméra indisponible", app.video_warning
         telemetry = getattr(app, "telemetry", None)
         battery = getattr(telemetry, "latest", {}).get("battery")
         if battery is None:
@@ -1280,44 +1309,65 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--sim", action="store_true", help="use the simulator instead of a drone")
     parser.add_argument("--record", metavar="DIR", help="save downward frames to DIR (dataset)")
+    parser.add_argument("--connection", choices=("ap", "sta"), help="skip network dialog using AP or STA")
+    parser.add_argument("--host", help="drone IPv4 (STA DHCP address or direct AP address)")
+    parser.add_argument("--sta-video", action="store_true", help="probe STA video; requires real decoded frames")
     args = parser.parse_args()
 
     log = LogRedirect(sys.stdout)
     sys.stdout = log
 
     root = tk.Tk()
-    if args.sim:
-        from drone.sim import FakeTello
-        tello = FakeTello(camera_turn_deg=cfg.CAM_ROTATE_DEG)
-    else:
-        from drone.connection import ConfiguredTello
-        tello = ConfiguredTello()
-
-    app = DroneApp(tello, record_dir=args.record)
+    root.withdraw()
+    app = None
+    mode = args.connection or "ap"
     try:
+        if args.sim:
+            from drone.sim import FakeTello
+            tello = FakeTello(camera_turn_deg=cfg.CAM_ROTATE_DEG)
+        else:
+            # Provisioning/discovery must finish before djitellopy binds UDP 8889.
+            if args.connection:
+                host = args.host or (cfg.TELLO_AP_HOST if args.connection == "ap" else cfg.TELLO_STA_HOST)
+                options = ConnectionOptions(args.connection, host, args.sta_video)
+            else:
+                options = choose_connection(root)
+                if options is None:
+                    return
+            mode = options.mode
+            from drone.connection import ConfiguredTello
+            tello = ConfiguredTello(host=options.host, network_mode=options.mode,
+                                   probe_video=options.probe_video)
+        app = DroneApp(tello, record_dir=args.record)
         app.start()
+        root.deiconify()
+        TelloGUI(root, app, log, sim=args.sim)
+        root.mainloop()
     except KeyboardInterrupt:
-        app.running = False
-        app.abort.set()
-        app.link.close()
-        root.destroy()
-        sys.stdout = log.original
         print("Verbinding afgebroken (Ctrl+C).")
-        return
     except Exception as e:
-        app.running = False
-        app.abort.set()
-        app.link.close()
         print(f"Opstarten mislukt: {e}")
-        root.withdraw()
+        help_text = ("STA : PC et drone sur le même réseau. Vérifier l'IP DHCP, le pare-feu UDP "
+                     "8889/8890 et l'isolation des clients.\n\n" + AP_RESET_HELP if mode == "sta" else
+                     "AP : connecter le PC au Wi-Fi TELLO du drone. Fermer les autres applications Tello.")
         messagebox.showerror("Drone opstarten mislukt",
-                             f"{e}\n\nZit de laptop op de Wi-Fi van de Tello?\n"
-                             "Testen zonder drone: python tello_gui.py --sim")
-        root.destroy()
+                             f"{e}\n\n{help_text}\n\nTesten zonder drone: python tello_gui.py --sim",
+                             parent=root)
+    finally:
+        if app is not None:
+            # Closing the connection window must never issue a flight command.
+            app.running = False
+            app.abort.set()
+            if hasattr(app, "telemetry"):
+                app.telemetry.stop()
+            if hasattr(app, "odometry"):
+                app.odometry.stop()
+            app.link.close()
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
         sys.stdout = log.original
-        return
-    TelloGUI(root, app, log, sim=args.sim)
-    root.mainloop()
 
 
 if __name__ == "__main__":

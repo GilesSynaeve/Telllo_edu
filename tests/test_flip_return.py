@@ -43,7 +43,7 @@ class FlipReturnTests(unittest.TestCase):
             target, max_speed=cfg.FLIP_RETURN_RC_SPEED, gain=cfg.FLIP_RETURN_GAIN,
             tolerance_cm=cfg.FLIP_RETURN_TOL_CM, timeout_s=cfg.FLIP_RETURN_TIMEOUT_S,
             settle_s=cfg.FLIP_RETURN_SETTLE_S, damping=cfg.FLIP_RETURN_DAMPING,
-            max_vertical_speed=cfg.FLIP_RETURN_Z_SPEED)
+            max_vertical_speed=cfg.FLIP_RETURN_Z_SPEED, z_tolerance_cm=cfg.FLIP_RETURN_Z_TOL_CM)
 
     def test_gui_xyz_returns_after_drift(self):
         def flip(*args, **kwargs):
@@ -85,7 +85,8 @@ class FlipReturnTests(unittest.TestCase):
             (10, 20, 80), max_speed=cfg.FLIP_RETURN_RC_SPEED,
             gain=cfg.FLIP_RETURN_GAIN, tolerance_cm=cfg.FLIP_RETURN_TOL_CM,
             timeout_s=cfg.FLIP_RETURN_TIMEOUT_S, settle_s=cfg.FLIP_RETURN_SETTLE_S,
-            damping=cfg.FLIP_RETURN_DAMPING, max_vertical_speed=cfg.FLIP_RETURN_Z_SPEED)
+            damping=cfg.FLIP_RETURN_DAMPING, max_vertical_speed=cfg.FLIP_RETURN_Z_SPEED,
+            z_tolerance_cm=cfg.FLIP_RETURN_Z_TOL_CM)
 
     def test_priority_flip_interrupts_recovery_without_being_swallowed(self):
         self.app.follower.hold_position.side_effect = FlightInterrupted()
@@ -210,6 +211,42 @@ class PriorityFlipTests(unittest.TestCase):
                 follower.hold_position((100, 0, 80), max_speed=40, gain=1.8)
         self.assertEqual(follower.send_velocity.call_args.args, (40, 0, 0))
         tello.send_rc_control.assert_called_with(0, 0, 0, 0)
+
+
+
+class FlipReturnAltitudeToleranceTests(unittest.TestCase):
+    """Replays the end state of the real flip of 2026-10-22 (flight_logs/last_flip.json):
+    xy back within 2.2 cm, altitude stuck 6.5 cm above the click height."""
+
+    TARGET = (-5.16, 2.76, 80.51)
+    REAL_END = (-6.07, 0.70, 87.0)
+
+    def hold(self, **kwargs):
+        pose = Pose()
+        pose.set(*self.REAL_END, 0)
+        pose.measured = True
+        follower = PathFollower(Mock(), pose, threading.Event())
+        follower.yaw_hold = False
+        return follower, follower.hold_position(
+            self.TARGET, max_speed=cfg.FLIP_RETURN_RC_SPEED, gain=cfg.FLIP_RETURN_GAIN,
+            tolerance_cm=cfg.FLIP_RETURN_TOL_CM, settle_s=0.2,
+            damping=cfg.FLIP_RETURN_DAMPING, max_vertical_speed=cfg.FLIP_RETURN_Z_SPEED, **kwargs)
+
+    def test_settled_xy_with_small_height_error_is_confirmed(self):
+        follower, arrived = self.hold(timeout_s=2, z_tolerance_cm=cfg.FLIP_RETURN_Z_TOL_CM)
+        self.assertTrue(arrived)
+        self.assertEqual(follower.last_hold_result["reason"], "stable_within_tolerance")
+
+    def test_old_shared_tolerance_could_never_confirm_this_state(self):
+        follower, arrived = self.hold(timeout_s=0.4)
+        self.assertFalse(arrived)
+        self.assertEqual(follower.last_hold_result["reason"], "timeout")
+
+    def test_large_height_error_is_still_not_confirmed(self):
+        pose_z = self.TARGET[2] + cfg.FLIP_RETURN_Z_TOL_CM + 2
+        self.REAL_END = (*self.REAL_END[:2], pose_z)
+        _, arrived = self.hold(timeout_s=0.4, z_tolerance_cm=cfg.FLIP_RETURN_Z_TOL_CM)
+        self.assertFalse(arrived)
 
 
 if __name__ == "__main__":

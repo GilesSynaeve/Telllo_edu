@@ -146,7 +146,8 @@ class FlipCaptureTests(unittest.TestCase):
             (12, -7, 85), max_speed=cfg.FLIP_RETURN_RC_SPEED, gain=cfg.FLIP_RETURN_GAIN,
             tolerance_cm=cfg.FLIP_RETURN_TOL_CM, timeout_s=cfg.FLIP_RETURN_TIMEOUT_S,
             settle_s=cfg.FLIP_RETURN_SETTLE_S, allow_local_reference=True,
-            damping=cfg.FLIP_RETURN_DAMPING, max_vertical_speed=cfg.FLIP_RETURN_Z_SPEED)
+            damping=cfg.FLIP_RETURN_DAMPING, max_vertical_speed=cfg.FLIP_RETURN_Z_SPEED,
+            z_tolerance_cm=cfg.FLIP_RETURN_Z_TOL_CM)
         self.assertTrue(self.app.last_flip_record["visual_reference_at_click"])
         self.assertFalse(self.app.last_flip_record["tracking_valid_at_click"])
         self.assertEqual(self.app.last_flip_record["status"], "confirmed")

@@ -5,10 +5,18 @@ Every datagram is one JSON object with a "type" field. See README for the
 full protocol.
 """
 
+import ipaddress
 import json
 import socket
 import threading
 import time
+
+
+def _is_loopback(host):
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost"
 
 
 class JetsonLink:
@@ -34,6 +42,16 @@ class JetsonLink:
         self._thread = threading.Thread(target=self._recv_loop, daemon=True)
         self._thread.start()
         print(f"📡 Waiting for Jetson commands on UDP {listen_host}:{listen_port}")
+        if jetson_host is None and not _is_loopback(listen_host):
+            print("⚠️  JETSON_HOST is not set: only commands from this laptop (127.0.0.1) are "
+                  "accepted. Put the Jetson IP in drone/config.py to accept it.")
+
+    def accepts(self, sender_ip):
+        """Only the configured Jetson may command the drone. Without JETSON_HOST only
+        local test scripts may: anyone on the LAN could otherwise send takeoff/flip."""
+        if self.jetson_host is not None:
+            return sender_ip == self.jetson_host
+        return _is_loopback(sender_ip)
 
     def _recv_loop(self):
         while self._running:
@@ -50,7 +68,7 @@ class JetsonLink:
             except ValueError as e:
                 print(f"⚠️  Invalid message from {addr}: {e}")
                 continue
-            if self.jetson_host is not None and addr[0] != self.jetson_host:
+            if not self.accepts(addr[0]):
                 print(f"⚠️  Bericht van {addr[0]} genegeerd (niet JETSON_HOST)")
                 continue   # with a fixed Jetson address, nobody else may send commands
             self._last_sender = addr[0]

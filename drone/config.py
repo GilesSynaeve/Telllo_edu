@@ -17,9 +17,15 @@ The Jetson converts real-world coordinates to this frame before sending them.
 # ---------------------------------------------------------------------------
 # Network link with the Jetson (JSON over UDP, one message per datagram)
 # ---------------------------------------------------------------------------
+TELLO_AP_HOST = "192.168.10.1"
+TELLO_CONNECTION_MODE = "ap"  # default remains the direct drone Wi-Fi
+TELLO_STA_HOST = ""           # optional LAN IPv4; never put Wi-Fi credentials here
+WIFI_REBOOT_WAIT_S = 12       # SDK says reboot after 3s; allow time for association/DHCP
+STA_VIDEO_PROBE_TIMEOUT_S = 4 # require decoded frames, not just a streamon acknowledgement
 LISTEN_HOST = "127.0.0.1"   # loopback by default; set to 0.0.0.0 only if required
 LISTEN_PORT = 9000          # Jetson sends commands to this port
-JETSON_HOST = None          # None = reply to whoever sent the last command;
+JETSON_HOST = None          # None = only local scripts (127.0.0.1) may send commands,
+                            # replies go to the last sender;
                             # an IP = only accept commands from that address
 JETSON_PORT = 9001          # Jetson listens on this port for status/events
 STATUS_INTERVAL = 1.0       # seconds between status messages
@@ -37,7 +43,10 @@ FLIP_RETURN_RC_SPEED = 25   # cap approach speed to avoid repeated overshoot wit
 FLIP_RETURN_GAIN = 1.2
 FLIP_RETURN_DAMPING = 0.4  # moderate velocity feedback avoids delayed opposite corrections
 FLIP_RETURN_Z_SPEED = 8    # cm/s, keep altitude corrections slower than horizontal recovery
-FLIP_RETURN_TOL_CM = 3     # measured xy radius and altitude tolerance, not absolute accuracy
+FLIP_RETURN_TOL_CM = 3     # measured xy radius tolerance, not absolute accuracy
+FLIP_RETURN_Z_TOL_CM = 8   # altitude tolerance (ToF). Flight log 2026-10-22: xy returned to
+                           # 2.2 cm, but z stayed 6.5 cm high while rc ud=-8 had no effect
+                           # (vertical stick dead zone), so a 3 cm z band could never confirm
 FLIP_RETURN_TIMEOUT_S = 8
 FLIP_RETURN_SETTLE_S = 0.4 # remain within tolerance before reporting a confirmed return
 FLIP_RECORD_PATH = "flight_logs/last_flip.json"  # written after recovery, never before SDK send

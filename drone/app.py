@@ -32,6 +32,7 @@ from .navigator import FlightInterrupted, MissionAborted, MotionEstimate, Odomet
 from .odometry import Odometry
 from .pad_recovery import PadRecovery
 from .telemetry import Telemetry
+from .video import station_video
 
 
 class CommandRejected(Exception):
@@ -103,6 +104,10 @@ class DroneApp:
         self._last_record = 0.0
         self._record_count = 0
         self.downvision_enabled = False
+        self.network_mode = getattr(tello, "network_mode", "ap")
+        self.video_available = True
+        self.vision_navigation_available = True
+        self.video_warning = ""
 
         self.link = JetsonLink(self.submit, cfg.LISTEN_HOST, cfg.LISTEN_PORT,
                                cfg.JETSON_HOST, cfg.JETSON_PORT)
@@ -111,18 +116,32 @@ class DroneApp:
     def start(self):
         self.tello.connect()
         print("Battery level:", self.tello.get_battery())
-        self.tello.streamon()
-        self.set_downvision(True)
-        self.frame_reader = self.tello.get_frame_read()
+        if self.network_mode == "sta":
+            video = station_video(self.tello, getattr(self.tello, "probe_video", False))
+            self.video_available, self.downvision_enabled = video.available, video.downward
+            self.vision_navigation_available = video.available and video.downward
+            self.video_warning, self.frame_reader = video.warning, video.reader
+            if self.video_warning:
+                print(f"⚠️  {self.video_warning}")
+            if not self.vision_navigation_available:
+                self.pose.position_valid = False
+                self.recording = False
+        else:
+            self.tello.streamon()
+            self.set_downvision(True)
+            self.frame_reader = self.tello.get_frame_read()
         self.mission_thread = threading.Thread(target=self.mission_loop, daemon=True)
         self.mission_thread.start()
-        threading.Thread(target=self.detect_loop, daemon=True).start()
-        self.odometry = Odometry(self.tello, self.pose, self.frame_reader, self.cam,
-                                 lambda: self.airborne, lambda: self.downvision_enabled)
-        self.telemetry = Telemetry(self.tello, self.pose, lambda: self.airborne)
+        if self.vision_navigation_available:
+            threading.Thread(target=self.detect_loop, daemon=True).start()
+            self.odometry = Odometry(self.tello, self.pose, self.frame_reader, self.cam,
+                                     lambda: self.airborne, lambda: self.downvision_enabled)
+        self.telemetry = Telemetry(self.tello, self.pose, lambda: self.airborne,
+                                   sensor_only=not self.vision_navigation_available)
         threading.Thread(target=self.status_loop, daemon=True).start()
 
     def set_downvision(self, enabled):
+        self.require_vision("Camera wisselen")
         enabled = bool(enabled)
         if self.downvision_enabled == enabled:
             return
@@ -172,6 +191,13 @@ class DroneApp:
         Runs in the caller's thread: never send flight commands from here.
         """
         t = msg["type"]
+        if t in ("mission", "helipad_land", "flip", "downvision"):
+            try:
+                self.require_vision(t)
+            except CommandRejected as exc:
+                print(f"⚠️  {exc}")
+                self.link.send({"type": "error", "ref": t, "error": str(exc)})
+                return False
         if t in ("abort", "land"):
             if t == "abort":
                 print("🛑 Abort")
@@ -296,6 +322,8 @@ class DroneApp:
 
     def handle_command(self, cmd):
         t = cmd["type"]
+        if t in ("mission", "helipad_land", "flip", "downvision"):
+            self.require_vision(t)
         if t == "mission":
             self.run_mission(cmd)
         elif t == "land":
@@ -497,13 +525,14 @@ class DroneApp:
                                 settle_s=cfg.FLIP_RETURN_SETTLE_S,
                                 damping=cfg.FLIP_RETURN_DAMPING,
                                 max_vertical_speed=cfg.FLIP_RETURN_Z_SPEED,
+                                z_tolerance_cm=cfg.FLIP_RETURN_Z_TOL_CM,
                                 **({"allow_local_reference": True} if visual_reference is not None else {}))
                             current = self.pose.get()
                             xy_error = math.hypot(current[0] - px, current[1] - py)
                             z_error = abs(current[2] - pz)
                             confirmed = (arrived is True and self.pose.measured and return_reference_valid()
                                          and xy_error < cfg.FLIP_RETURN_TOL_CM
-                                         and z_error < cfg.FLIP_RETURN_TOL_CM)
+                                         and z_error < cfg.FLIP_RETURN_Z_TOL_CM)
                             if record is not None:
                                 record.update(status="confirmed" if confirmed else "not_confirmed",
                                               return_reference="click_image" if visual_reference is not None else "global",
@@ -570,6 +599,8 @@ class DroneApp:
         frame (H sightings, terrain map, GUI trail) no longer fits, so it goes too.
         """
         self.pose.reset()
+        if not getattr(self, "vision_navigation_available", True):
+            self.pose.position_valid = False
         if hasattr(self, "odometry"):
             self.odometry.reset_tracking()
         self.pads = []
@@ -621,6 +652,11 @@ class DroneApp:
             self._motion_phase = None
         height = self.read_height(default=80)
         self.pose.set(z=height)
+        if not getattr(self, "vision_navigation_available", True):
+            self.pose.position_valid = False
+            self.state = "flying"
+            print("En vol — télémétrie uniquement, position horizontale non mesurée.")
+            return
         self.state = "flying"
         # Climbing changes image scale and can temporarily interrupt tracking.
         # Allow fresh level frames to arrive before deciding whether to recenter.
@@ -651,6 +687,7 @@ class DroneApp:
 
     def helipad_test(self):
         """Test without a path: take off (if needed), look for the H here and land on it."""
+        self.require_vision("Atterrissage H")
         self.takeoff()
         x, y, _, _ = self.pose.get()
         local = not self.pose.position_valid and self.pose.local_reference_valid
@@ -733,6 +770,7 @@ class DroneApp:
         self.state = "idle"
 
     def run_mission(self, msg):
+        self.require_vision("Mission")
         # check everything before taking off; a bad mission must not land a hovering drone
         try:
             waypoints = validate_waypoints(msg["waypoints"])
@@ -874,6 +912,7 @@ class DroneApp:
         seen during the whole flight (helipad_search): fly back to the first
         waypoint and land there.
         """
+        self.require_vision("Atterrissage H")
         z = self.pose.get()[2]
         pad = self.seen_helipad()
         if pad is not None:
@@ -936,6 +975,7 @@ class DroneApp:
         (nothing done), True only when the drone is low and stable above the H
         and only the final 'land' is left.
         """
+        self.require_vision("Atterrissage H")
         f = self.follower
         sighting = self._pad_near(end_xy, 0)
         if sighting is None or time.time() - sighting[0] > 0.4:
@@ -1098,6 +1138,7 @@ class DroneApp:
         self.state = "idle"
 
     def toggle_recording(self):
+        self.require_vision("Opnemen")
         self.recording = not self.recording
         print(f"🎥 Opnemen {'AAN -> ' + self.record_dir if self.recording else 'UIT'}")
 
@@ -1184,9 +1225,17 @@ class DroneApp:
         # thread talks to the Tello at a time.
         self.mission_thread.join(timeout=cfg.RESPONSE_TIMEOUT)
         self.safe_land()
-        try:
-            self.tello.streamoff()
-        except Exception:
-            pass
+        if hasattr(self, "odometry"):
+            self.odometry.stop()
+        if getattr(self, "video_available", True):
+            try:
+                self.tello.streamoff()
+            except Exception:
+                pass
         self.link.close()
         print("Drone landed and disconnected")
+
+    def require_vision(self, action):
+        if not getattr(self, "vision_navigation_available", True):
+            raise CommandRejected(f"{action} indisponible : caméra inférieure non confirmée en STA. "
+                                  "Revenir en AP pour la navigation visuelle.")

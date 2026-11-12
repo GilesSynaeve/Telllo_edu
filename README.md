@@ -26,10 +26,16 @@ docs/                 afbeeldingen voor deze README
  Jetson  ◀──(UDP 9001: status / events ...)──  Laptop  ◀──(video onderste camera)──
 ```
 
-De laptop hangt aan de Wi-Fi van de Tello. De Jetson moet de laptop via een **tweede netwerk**
-kunnen bereiken (ethernetkabel of tweede Wi-Fi-adapter). Een alternatief: de Tello EDU in
-*station mode* aan een router hangen (`ap <ssid> <wachtwoord>` sturen), dan zitten Tello,
-laptop en Jetson op hetzelfde netwerk en maak je de drone aan met `Tello(host="<ip van de tello>")`.
+Bij het starten van `tello_gui.py` kies je **AP** (directe Tello-Wi-Fi) of **STA**
+(drone en laptop op de thuisrouter, met internet op de laptop). De verbindingswizard
+kan STA configureren vanuit AP en het lokale IP zoeken. Wachtwoorden worden niet opgeslagen.
+**Video in STA is firmware-afhankelijk**: zonder bevestigde ondercamera zijn visuele
+navigatie, missies, salto-terugkeer en H-landing uitgeschakeld.
+Zie de [volledige AP/STA-handleiding en herstelprocedure](docs/wifi-ap-sta.md).
+
+In AP heeft de Jetson een tweede netwerk nodig om de laptop te bereiken.
+De Jetson-link luistert standaard alleen op `127.0.0.1`; voor een externe Jetson
+blijven de netwerkparameters in `drone/config.py` van toepassing.
 
 ## Coördinatenstelsel (“mission frame”)
 

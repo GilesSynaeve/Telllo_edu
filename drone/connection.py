@@ -8,7 +8,7 @@ from djitellopy import Tello
 from . import config as cfg
 
 
-def network_hint(host):
+def network_hint(host, mode="ap"):
     """Ask the OS which local address it would use; no packet is transmitted."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
@@ -17,25 +17,46 @@ def network_hint(host):
     except OSError as exc:
         return f"Geen netwerkroute naar {host}: {exc}"
     hint = f"Drone: {host}:8889 (UDP). Lokaal IP: {local_ip}."
-    if host == "192.168.10.1" and not local_ip.startswith("192.168.10."):
+    if mode != "sta" and host == "192.168.10.1" and not local_ip.startswith("192.168.10."):
         hint += ("\nHet gebruikte netwerk is niet het directe Tello-netwerk. "
                  "Verbind met de Wi-Fi van de drone (TELLO-...), ook zonder internet.")
     return hint
 
 
 class ConfiguredTello(Tello):
+    def __init__(self, host=cfg.TELLO_AP_HOST, network_mode="ap", probe_video=False, **kwargs):
+        from .network import ConnectionOptions
+        options = ConnectionOptions(network_mode, host, probe_video)
+        self.network_mode, self.probe_video = options.mode, options.probe_video
+        super().__init__(host=options.host, **kwargs)
+
     # Explicit forwarding works with djitellopy's decorated methods. Changing
     # Tello.RESPONSE_TIMEOUT does not change their bound default arguments.
+    @staticmethod
+    def _check_public_command(command):
+        words = command.split()
+        if words and words[0].lower() in ("ap", "wifi", "ap?", "ssid?"):
+            raise ValueError("Utiliser l'assistant Wi-Fi de démarrage : commandes sensibles interdites dans les logs SDK.")
+
+    def send_command_without_return(self, command):
+        self._check_public_command(command)
+        return super().send_command_without_return(command)
+
     def send_command_with_return(self, command, timeout=None):
+        self._check_public_command(command)
         return super().send_command_with_return(
             command, timeout=cfg.RESPONSE_TIMEOUT if timeout is None else timeout)
 
     def send_control_command(self, command, timeout=None):
+        self._check_public_command(command)
         return super().send_control_command(
             command, timeout=cfg.RESPONSE_TIMEOUT if timeout is None else timeout)
 
     def connect(self, wait_for_state=True):
-        hint = network_hint(self.address[0])
+        mode = getattr(self, "network_mode", "ap")
+        hint = network_hint(self.address[0], mode)
+        guidance = ("Vérifier l'IP DHCP du drone, le même réseau local et l'absence d'isolation des clients."
+                    if mode == "sta" else "Vérifier le Wi-Fi TELLO du drone et fermer les autres applications Tello.")
         print(hint)
         response = "geen antwoord"
         for attempt in range(cfg.CONNECT_ATTEMPTS):
@@ -47,7 +68,7 @@ class ConfiguredTello(Tello):
             raise ConnectionError(
                 f"Geen SDK-antwoord van de drone na {cfg.CONNECT_ATTEMPTS} pogingen.\n"
                 f"{hint}\nAntwoord: {response}\n"
-                "Controleer of de drone aanstaat en of een andere Tello-app gesloten is.")
+                + guidance)
 
         if wait_for_state:
             deadline = time.monotonic() + cfg.CONNECT_STATE_TIMEOUT
