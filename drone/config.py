@@ -142,7 +142,10 @@ GEOFENCE = {
 FRAME_IS_RGB = True         # djitellopy >= 2.4 delivers RGB frames
 DOWNCAM_CROP = None         # (x, y, w, h) of the useful image area, or None
 AUTO_CROP = False           # keep optical centre fixed; dark scene regions are not video padding
-CAM_HFOV_DEG = 60.0         # horizontal field of view of the bottom camera
+CAM_HFOV_DEG = 70.0         # horizontal field of view of the bottom camera.
+                            # Measured 2026-11-12 on our drone (ground_check.py snap, A4 sheet,
+                            # ToF heights 61/80/101 cm): 70.6/69.6/69.4 deg. 60 gave distances
+                            # ~17% too short; 70 is within +-1% at 60-100 cm (with the ToF height)
 CAM_FORWARD_SIGN = 1        # 1: top of image = drone forward, -1: flipped
 CAM_LEFT_SIGN = 1           # 1: left of image = drone left,   -1: flipped
 CAM_ROTATE_DEG = 270          # camera image turned 0/90/180/270 deg relative to the drone.
