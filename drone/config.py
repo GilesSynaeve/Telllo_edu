@@ -195,6 +195,10 @@ RECORD_DIR = "dataset"      # default folder when recording is toggled on
 RECORD_HZ = 2               # images per second (don't make near-identical images)
 RECORD_ONLY_AIRBORNE = False  # True: only save while flying
 
+# Telemetry of every session (pose estimate, odometry state, sensors) is written
+# to this folder after each landing and at shutdown, for flight analysis.
+TELEMETRY_LOG_DIR = "flight_logs"
+
 # ---------------------------------------------------------------------------
 # Puddle detection with a trained model (YOLO from Ultralytics, e.g. trained on
 # the Roboflow dataset). Needs `pip install ultralytics`; without a model file

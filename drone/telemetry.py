@@ -28,7 +28,7 @@ from . import config as cfg
 # Sample fields, in CSV/column order
 FIELDS = ("t", "flight_s", "battery", "temp", "tof", "h", "baro", "alt", "ground",
           "pitch", "roll", "yaw_imu", "vx", "vy", "vz", "ax", "ay", "az",
-          "x", "y", "z", "yaw", "odo", "odo_q", "pad")
+          "x", "y", "z", "yaw", "odo", "position_valid", "odo_q", "pad")
 
 
 def _num(v):

@@ -794,6 +794,7 @@ class DroneApp:
         self._pose_set = False
         self.pose.set(z=0)
         self.state = "idle"
+        self.save_telemetry()
 
     def run_mission(self, msg):
         self.require_vision("Mission")
@@ -1509,6 +1510,7 @@ class DroneApp:
         # thread talks to the Tello at a time.
         self.mission_thread.join(timeout=cfg.RESPONSE_TIMEOUT)
         self.safe_land()
+        self.save_telemetry()
         if hasattr(self, "odometry"):
             self.odometry.stop()
         if getattr(self, "video_available", True):
@@ -1518,6 +1520,24 @@ class DroneApp:
                 pass
         self.link.close()
         print("Drone landed and disconnected")
+
+    def save_telemetry(self):
+        """Write the whole session's telemetry to one CSV (overwritten with the full
+        history after every landing). Never raises: a log must not affect flying."""
+        telemetry = getattr(self, "telemetry", None)
+        if telemetry is None:
+            return None
+        try:
+            if getattr(self, "_telemetry_log", None) is None:
+                self._telemetry_log = os.path.join(
+                    cfg.TELEMETRY_LOG_DIR, time.strftime("telemetry_%Y%m%d_%H%M%S.csv"))
+            os.makedirs(os.path.dirname(self._telemetry_log) or ".", exist_ok=True)
+            rows = telemetry.export_csv(self._telemetry_log)
+            print(f"📝 Telemetrie bewaard: {self._telemetry_log} ({rows} metingen)")
+            return self._telemetry_log
+        except Exception as e:
+            print(f"⚠️  Telemetrie niet bewaard: {e}")
+            return None
 
     def require_vision(self, action):
         if not getattr(self, "vision_navigation_available", True):
