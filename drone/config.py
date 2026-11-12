@@ -191,3 +191,42 @@ TERRAIN_PROFILE_MAX = 6000  # samples kept for the height profile along the trac
 RECORD_DIR = "dataset"      # default folder when recording is toggled on
 RECORD_HZ = 2               # images per second (don't make near-identical images)
 RECORD_ONLY_AIRBORNE = False  # True: only save while flying
+
+# ---------------------------------------------------------------------------
+# Puddle detection with a trained model (YOLO from Ultralytics, e.g. trained on
+# the Roboflow dataset). Needs `pip install ultralytics`; without a model file
+# everything else works as before.
+# ---------------------------------------------------------------------------
+PUDDLE_MODEL = "models/puddles.pt"  # best.pt from training (.pt, .onnx or TensorRT .engine)
+PUDDLE_CONF = 0.4           # minimum confidence of a detection
+PUDDLE_IMGSZ = 320          # image size used for training (imgsz=...)
+PUDDLE_HZ = 5               # model runs per second at most (runs in its own thread)
+PUDDLE_DEVICE = None        # None = automatic (GPU if there is one), or "cpu", 0, ...
+PUDDLE_MERGE_CM = 40        # detections closer than this belong to the same puddle
+PUDDLE_MIN_HITS = 3         # a puddle counts (and goes to the Jetson) after this many detections
+PUDDLE_EDGE_PX = 4          # ignore boxes touching the image edge for the position (half in view)
+# Photo of every puddle found during a mission: the drone interrupts its path,
+# centres itself above the puddle (steering on fresh detections), takes a photo
+# straight down as confirmation, and then continues the path.
+PUDDLE_PHOTO = True
+PUDDLE_PHOTO_DIR = "photos"
+PUDDLE_CENTER_TOL_CM = 6    # puddle middle at most this far from straight below the drone ...
+PUDDLE_CENTER_STABLE_S = 0.5  # ... for this long before the photo
+PUDDLE_PHOTO_TIMEOUT_S = 15  # not centred after this: take the photo anyway (offset is logged)
+
+# ---------------------------------------------------------------------------
+# Path on the floor (a strip of tape or paper) seen by the downward camera.
+# Recognised in every flight (drawn on the GUI's ground map); the mission type
+# 'follow_path' flies along it. Tune the look of the strip here.
+# ---------------------------------------------------------------------------
+PATH_DETECT = True
+PATH_DARK = True            # True: dark strip on a lighter floor, False: light strip on dark
+PATH_WIDTH_CM = (2, 30)     # width of the strip
+PATH_MIN_LENGTH_CM = 35     # shorter dark/light shapes are not the path (H bars, puddles)
+PATH_MIN_CONTRAST = 25      # grey levels between strip and floor
+PATH_SPEED = 20             # cm/s along the path
+PATH_LOOKAHEAD_CM = 25      # aim this far ahead along the strip
+PATH_GAIN = 1.0             # 1/s, sideways speed per cm off the middle of the strip
+PATH_END_CM = 8             # the strip ends this close ahead (inside the image): path done
+PATH_LOST_S = 2.0           # strip not seen this long: stop (end of the path or lost)
+PATH_MAX_S = 300            # safety: never follow longer than this

@@ -10,6 +10,8 @@ values instead of jumping, and x and y always have the same scale.
 import math
 import tkinter as tk
 
+import numpy as np
+
 import matplotlib
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.colors import LinearSegmentedColormap, Normalize
@@ -111,6 +113,7 @@ class Map3D:
         self.rotors = [line("-", color=C["danger"], linewidth=1.5) for _ in range(4)]
         self.nose = line("-", color=C["danger"], linewidth=3)
         self.pad = line("s", color=C["cyan"], markersize=11, alpha=0.75, linestyle="none")
+        self.puddles = line("o", color=C["water"], markersize=10, alpha=0.75, linestyle="none")
         self.footprint = line("-", color=C["cyan"], linewidth=0.8, alpha=0.5)
 
     # ------------------------------------------------------------- view
@@ -157,11 +160,12 @@ class Map3D:
     # ------------------------------------------------------------- drawing
     @staticmethod
     def _set(artist, pts):
+        # matplotlib >= 3.10 draws Line3D data as arrays (it reads .shape): no plain lists
         if pts:
             xs, ys, zs = zip(*pts)
-            artist.set_data_3d(list(xs), list(ys), list(zs))
+            artist.set_data_3d(np.asarray(xs, float), np.asarray(ys, float), np.asarray(zs, float))
         else:
-            artist.set_data_3d([], [], [])
+            artist.set_data_3d(np.empty(0), np.empty(0), np.empty(0))
 
     def _drone(self, x, y, z, yaw, pitch, roll):
         """Quadcopter X-frame, rotated by yaw and tilted by pitch/roll."""
@@ -237,6 +241,8 @@ class Map3D:
         pad = s.get("helipad")
         pad_pts = [(pad[0], pad[1], 0)] if pad is not None else []
         self._set(self.pad, pad_pts)
+        puddle_pts = [(p[0], p[1], 0) for p in s.get("puddles", [])]
+        self._set(self.puddles, puddle_pts)
         fp = s.get("footprint")
         self._set(self.footprint, [(px, py, ground) for px, py in fp] if fp else [])
         self._terrain(s["terrain"], s["terrain_version"])
@@ -251,6 +257,8 @@ class Map3D:
                 labels.append((p, f" M{i + 1}", C["accent"]))
         for p in pad_pts:
             labels.append((p, " H", C["cyan"]))
+        for p, (_, _, pid, _) in zip(puddle_pts, s.get("puddles", [])):
+            labels.append((p, f" P{pid}", C["water"]))
         key = tuple((tuple(round(v) for v in pt), t) for pt, t, _ in labels)
         if key != self._label_key:
             self._label_key = key
@@ -259,8 +267,8 @@ class Map3D:
             self._labels = [self.ax.text(*pt, text, color=c, fontsize=8)
                             for pt, text, c in labels]
 
-        self._limits(wps + mission + s["trail"] + s.get("local_trail", []) + [(x, y, z)]
-                     + pad_pts)
+        self._limits(wps + mission + s["trail"][-400:] + s.get("local_trail", [])[-400:]
+                     + [(x, y, z)] + pad_pts + puddle_pts)
         self.canvas.draw_idle()
 
 
@@ -271,6 +279,7 @@ def legend(parent):
                         (C["ok"], "bereikt"), (C["trail"], "gevlogen"),
                         (C["warn"], "relatief spoor"),
                         (C["danger"], "drone (neus)"), (C["cyan"], "H (landingsplaats)"),
+                        (C["water"], "plas"),
                         ("#a16207", "terrein hoger"), ("#2563eb", "terrein lager")):
         tk.Label(row, text="●", fg=color, bg=C["panel"]).pack(side=tk.LEFT)
         tk.Label(row, text=text, fg=C["muted"], bg=C["panel"],

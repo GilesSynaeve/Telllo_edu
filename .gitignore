@@ -5,3 +5,13 @@ venv/
 .venv/
 dataset/
 flight_logs/
+yolo-env
+runs
+models
+weights
+yolo11n.pt
+runs/
+yolo-env/
+*.pt
+!models/*.pt
+photos/

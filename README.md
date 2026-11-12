@@ -1,7 +1,7 @@
 # Tello EDU – autonoom pad volgen + landen op een H
 
 ```
-tello_gui.py          ← start hier: grafische besturing (pad plannen, 3D, terrein, sensoren, camera)
+tello_gui.py          ← start hier: grafische besturing (pad plannen, grondkaart, 3D, terrein, sensoren, camera)
 tello_combined.py     ← live vliegen met het toetsenbord (ZQSD), handig om te testen/kalibreren
 drone/
     app.py            kern: missies afvliegen, landen op een H, Jetson-koppeling
@@ -10,10 +10,11 @@ drone/
     odometry.py       meet de echte beweging: camera (visuele odometrie), kompas, hoogte
     downcam.py        onderste camera: grijs + bijsnijden, pixel → coördinaat
     helipad.py        H-landingsplatform herkennen (zonder training)
+    puddles.py        plassen herkennen met een getraind YOLO-model + samenvoegen
     jetson_link.py    UDP/JSON-communicatie met de Jetson
     telemetry.py      alle sensorwaarden over tijd + terreinkaart (barometer − ToF)
     sim.py            simulator: alles testen zonder drone (`--sim`), met dozen op de vloer
-gui/                  onderdelen van de GUI: thema, instrumenten, 3D-weergave, kaart
+gui/                  onderdelen van de GUI: thema, instrumenten, grondkaart, 3D-weergave, kaart
     keypress.py       toetsenbord-hulp voor tello_combined.py
 json_flights/         opgeslagen vluchten (JSON), te openen met Opslaan/Laden in de GUI
 docs/                 afbeeldingen voor deze README
@@ -103,13 +104,32 @@ van in pop-ups.
   [Coördinatenstelsel](#coördinatenstelsel-mission-frame)) en **NOODSTOP** (toets X, motoren
   uit, de drone valt!).
 
-**Midden: drie tabbladen** (Ctrl+1/2/3)
-* **3D-weergave**: assenkruis bij de start (x rood = vooruit, y groen = links, z blauw = hoogte),
-  oranje = gepland pad, blauw = actieve missie (ook van de Jetson), groen = bereikte punten,
-  roze = gevlogen spoor, het drone-modelletje draait mee met de richting en kantelt met
-  pitch/roll (rode rotors = voorkant), cyaan = de gevonden H en wat de camera nu ziet, gekleurde
-  tegels = gemeten terrein. Slepen = draaien, scrollen = zoomen, of kies *3D*, *Boven*,
-  *Zijkant* of *Achter*. De assen schuiven vloeiend mee in plaats van te verspringen.
+**Midden: vier tabbladen** (Ctrl+1/2/3/4)
+* **Grondkaart** (hoofdbeeld): de **vloer van bovenaf**, opgebouwd uit de beelden van de
+  onderste camera. Elk beeld wordt op de vloer gelegd met de positie en de ToF-hoogte van
+  het moment dat het genomen werd (zoals de H- en plasposities), zodat het gevlogen gebied
+  één foto van de grond wordt. Hoe beter de odometrie, hoe mooier de naden. Erop staan de
+  **plassen** (blauwe cirkels op hun gemeten grootte, P1, P2, …), de gevonden
+  **H-platformen** (cyaan H1, H2, …), de **startlocaties** (groene vierkantjes S1, S2, …),
+  het **herkende pad** (oranje, zie [Pad op de vloer](#pad-op-de-vloer-herkennen-en-volgen)),
+  het **virtuele pad** (blauwe band met een streepje per meter) en dun het gevlogen spoor
+  (roze, pijltjes = vliegrichting). Het virtuele pad is het herkende pad of de geplande route
+  vanaf de start (keuze rechtsboven);
+  elke plas wordt erop geprojecteerd (blauw ruitje) en de lijst rechts zegt waar hij ligt:
+  *x m op het pad, y cm links/rechts*, plus de coördinaten (cm).
+  Elke start zet het assenstelsel opnieuw op de drone, maar de GUI hangt de vluchten aan
+  elkaar: de plek waar de drone landde is de start van de volgende vlucht, zodat alle
+  vluchten sinds de laatste *Reset omgeving* op één kaart staan, t.o.v. de startplek van de
+  eerste vlucht (S1). Bij meer vluchten heten de plassen V1-P1, V2-P1, … (vlucht, nummer dat
+  de Jetson kreeg; de Jetson krijgt de coördinaten in het assenstelsel van die vlucht). Is
+  de drone met de hand verplaatst, druk dan op *Reset omgeving*: dan begint een nieuwe
+  kaart. *Wis kaart* begint opnieuw, *Opslaan* bewaart de weergave als PNG, de grondkaart
+  zelf als `…_grond.png` (1 cm per pixel) en een JSON met alle coördinaten (voor een
+  verslag). Scrollen = zoomen, *Passend* toont weer alles.
+* **3D-weergave**: overzicht van de drone zelf: assenkruis bij de start (x rood = vooruit,
+  y groen = links, z blauw = hoogte), gepland pad, gevlogen spoor, het drone-modelletje
+  (draait mee en kantelt met pitch/roll), de H, de plassen en het terrein. Slepen = draaien,
+  scrollen = zoomen, of kies *3D*, *Boven*, *Zijkant* of *Achter*.
 * **Kaart & terrein**: bovenaanzicht met de terreinkaart. **Klik** om een punt toe te voegen
   (hoogte = het z-veld), **sleep** een punt om het te verplaatsen, **rechtsklik** om het te
   wissen, scroll om te zoomen. De gevonden H staat er als cyaan cirkel. Rechts de terreinanalyse,
@@ -136,6 +156,7 @@ gewoon uitgevoerd en getekend.
 | type | velden | betekenis |
 |---|---|---|
 | `mission` | `id`, `waypoints` (`[{"x","y","z"}, …]` of `[[x,y,z], …]`), optioneel `speed` (10-100 cm/s), `land_at_end`, `nav_mode` (`"go"`/`"rc"`), `fine` (`"auto"`/`"all"`/`"last"`/`"off"`), `level`, `helipad_search` (zie [Landen op een H](#landen-op-een-h-helipad)) | Opstijgen (als nodig) en de waypoints afvliegen |
+| `follow_path` | `id`, optioneel `speed` (5-50 cm/s, standaard `PATH_SPEED`), `land_at_end`, `reverse` | Opstijgen (als nodig) en de strook op de vloer volgen tot ze ophoudt (zie [Pad op de vloer](#pad-op-de-vloer-herkennen-en-volgen)) |
 | `abort` | – | Missie afbreken na de huidige stap en landen |
 | `land` / `takeoff` | – | `land` breekt ook een lopende missie af |
 | `helipad_land` | – | Test zonder pad: opstijgen (als nodig), een H onder de drone zoeken en erop landen |
@@ -147,14 +168,39 @@ gewoon uitgevoerd en getekend.
 
 | type | velden |
 |---|---|
-| `status` | `state`, `battery`, `pos {x,y,z,yaw}`, `odometry` (true/false), `mission`, `waypoint_index`, `helipad` (`{x, y}` of `null`) (elke seconde) |
+| `status` | `state`, `battery`, `pos {x,y,z,yaw}`, `odometry` (true/false), `mission`, `waypoint_index`, `helipad` (`{x, y}` of `null`), `puddles` (aantal gevonden plassen) (elke seconde) |
 | `ack` | `ref`, … |
 | `waypoint_reached` | `id`, `index`, `pos` |
-| `mission_done` / `mission_aborted` | `id`, `helipad` (waar de H gezien is, of `null`) |
+| `puddle` | `id`, `x`, `y` (cm, mission frame), `size_cm` (`[breedte, lengte]` van de box), `area_cm2`, `confidence`, `hits`, `mission` (één keer per plas, zodra hij `PUDDLE_MIN_HITS` keer gezien is) |
+| `puddle_photo` | zoals `puddle`, plus `photo` (bestand op de laptop) en `offset_cm` (afstand tussen het midden van de plas en recht onder de drone bij de foto) |
+| `path_done` | `id`, `reason` (einde van het pad, pad niet meer gezien, …), `helipad`, `puddles` |
+| `mission_done` / `mission_aborted` | `id`, `helipad` (waar de H gezien is, of `null`), `puddles` (lijst zoals bij `puddle`) |
 | `error` | `ref`, `error` |
 
-Objectdetectie (bv. plassen) zit niet in deze code: dat doet een getraind model, bv. op de
-Jetson, op de beelden van de camera.
+Plassen worden herkend door een getraind model, zie [Plassen herkennen](#plassen-herkennen-getraind-model).
+
+## Pad op de vloer herkennen en volgen
+
+De drone kan op twee manieren vliegen:
+
+* **Geplande route**: de waypoints die je plant (*Start missie*, of `mission` van de Jetson).
+* **Pad volgen**: een strook **tape of papier op de vloer** (*Volg pad op de vloer*, of
+  `follow_path` van de Jetson). Zet de drone op of vlak bij het begin van de strook, met de
+  neus de kant op die hij moet vliegen. Hij stijgt op, volgt de strook met `PATH_SPEED` en
+  stopt waar ze ophoudt (of als hij ze `PATH_LOST_S` seconden niet meer ziet), en landt
+  daar (of op een H die hij onderweg zag). Een plas onderweg onderbreekt het volgen voor de
+  foto, daarna zoekt hij de strook weer op.
+
+De herkenning (`drone/pathline.py`) zoekt in het beeld van de onderste camera de grootste
+lange, smalle vorm die duidelijk donkerder (`PATH_DARK = True`) of lichter is dan de vloer,
+`PATH_WIDTH_CM` breed en minstens `PATH_MIN_LENGTH_CM` lang (zo tellen de balken van de H en
+papieren plassen niet mee). Ze draait in **elke** vlucht: ook tijdens een geplande route wordt
+het pad dat de drone onder zich ziet op de grondkaart getekend (oranje), en in het
+camerabeeld staat de herkende strook als oranje lijn. Pas `PATH_*` in `drone/config.py` aan
+jullie strook aan (kleur, breedte). De simulator heeft een donkere tape-strook van 5 cm.
+
+Op de **grondkaart** kies je rechtsboven waarop de plassen geprojecteerd worden: het
+**herkende pad** (als er een is, anders de geplande route) of de **geplande route**.
 
 ## Hoe het werkt
 
@@ -223,7 +269,14 @@ ook zonder wind. Met werkende odometrie corrigeert het script dat nu:
 
 * de odometrie blijft meten terwijl de drone stijgt of daalt (vroeger begon ze bij elke
   hoogteverandering opnieuw, waardoor het afschuiven tijdens het opstijgen niet gemeten werd);
-* na het opstijgen gaat de drone terug boven de startplek (`TAKEOFF_RECENTER`);
+* tijdens het stijgen of dalen zoomt het camerabeeld in of uit; de odometrie brengt het nieuwe
+  beeld eerst terug naar de schaal en richting van het referentiebeeld (met de hoogte en yaw van
+  het moment dat het beeld genomen werd) en controleert de overeenkomst (`VO_MIN_CORRELATION`).
+  Zonder dat las ze de zoom als een verschuiving naar iets dat opvalt (de H, een tegelrand) en
+  “zag” ze ~20 cm afschuiven dat er niet was, waarna de drone die afstand de andere kant op vloog;
+* na het opstijgen gaat de drone terug boven de startplek (`TAKEOFF_RECENTER`), tot op 3 cm,
+  maximaal 3 s en gedempt; wordt de afwijking groter in plaats van kleiner (verkeerde
+  camerakalibratie), dan stopt de correctie meteen;
 * aan het einde van een missie daalt hij langzaam tot `LAND_HOVER_CM` (30 cm) terwijl hij boven
   het laatste punt blijft, pas daarna volgt de gewone `land` (`PRECISE_LAND`). De knop *Landen*
   en een noodlanding landen meteen, zonder deze stap.
@@ -258,9 +311,18 @@ Ziet de drone tijdens een missie (met `land_at_end`) ergens een landingsplatform
    coördinaten van het laatste punt.
 3. De drone stuurt zich boven het midden van de H en daalt alleen als hij erboven gecentreerd
    is (`HELIPAD_CENTER_TOL_CM`, 6 cm). De H wordt in elk camerabeeld opnieuw gemeten, dus hij
-   blijft corrigeren tijdens het dalen.
-4. Op `HELIPAD_FINAL_CM` (40 cm), of zodra de H de helft van het beeld vult, volgt de gewone
-   `land`.
+   blijft corrigeren tijdens het dalen. Het midden is het midden van de dwarsbalk (de "-").
+   Alleen een verse meting (`HELIPAD_CONTROL_MAX_AGE_S`) mag de drone sturen; een korte
+   gemiste detectie wordt overbrugd door de tracker, nooit door een oud beeld.
+4. Op `HELIPAD_FINAL_CM` (50 cm, voor de H uit het beeld valt) wacht hij tot hij langzaam
+   (`HELIPAD_FINAL_SPEED_CMS`) en binnen `HELIPAD_FINAL_TOL_CM` (3 cm) boven het midden hangt,
+   en pas dan volgt `land`. H kwijt: hij blijft hangen en zoekt kort terug; na 3 s geen H wordt
+   de H-landing afgebroken (geen blinde landing op oude coördinaten).
+
+*Niet overgenomen bij het samenvoegen (merge-main):* de variant van `main` die onder ~45 cm de
+dwarsbalk volgt tot 25 cm (`find_center`, integrerende duw). `HelipadDetector.find_center`
+bestaat nog in `drone/helipad.py`, maar wordt niet gebruikt; die variant moet eerst met de
+tests van deze branch en op de echte drone vergeleken worden.
 
 De detectie werkt zonder training: een donkere H op licht papier of een lichte H op een donker
 platform, in elke richting gedraaid, vierkant of hoger dan breed. Andere vormen (vlekken,
@@ -340,8 +402,7 @@ verkeerde kant op, dan schakelt die zichzelf uit (zie `YAW_SIGN`).
 
 ## Beelden opnemen (dataset voor het model)
 
-Objectdetectie gebeurt door een getraind model buiten deze code. Beelden om dat model te
-trainen neem je zo op:
+Beelden om het plasmodel te trainen neem je zo op:
 
 ```bash
 python tello_gui.py --record dataset
@@ -351,6 +412,55 @@ Dit slaat 2 beelden per seconde van de onderste camera op als PNG, al bijgesnede
 grijswaarden. Opnemen kun je ook aan en uit zetten met de knop *Opnemen* in de GUI. Train op
 beelden van **dezelfde camera, hoogte en vloer** als tijdens de missie: dat is belangrijker
 dan het aantal beelden.
+
+## Plassen herkennen (getraind model)
+
+De laptop draait een YOLO-model (Ultralytics) op het beeld van de onderste camera. De
+gevonden plassen krijgen een blauw kader in het camerabeeld van de GUI, met de zekerheid en
+(in de lucht) hun coördinaat. Op de grondkaart, de kaart en in de 3D-weergave verschijnen ze als **P1, P2, …**
+De Jetson krijgt per plas één `puddle`-bericht met de coördinaten (zie [Protocol](#protocol-json-over-udp-één-bericht-per-pakket)).
+
+1. Train het model op je Roboflow-dataset (export *YOLOv11*):
+   ```bash
+   pip install ultralytics
+   yolo detect train data=dataset/data.yaml model=yolo11n.pt imgsz=320 epochs=100
+   ```
+2. Kopieer `runs/detect/train/weights/best.pt` naar **`models/puddles.pt`**.
+3. Start de GUI zoals altijd. In het vak met de H-info staat of het model geladen is.
+
+Test het model eerst los op opgenomen beelden, een map of een video:
+
+```bash
+python -m drone.puddles dataset/test/images
+python -m drone.puddles vlucht.mp4
+```
+
+Hoe het werkt (`drone/puddles.py`):
+
+* Het model draait in een eigen thread op het nieuwste beeld (max. `PUDDLE_HZ` keer per
+  seconde), zodat een traag model de H-detectie en het camerabeeld niet ophoudt.
+* Het model krijgt hetzelfde beeld als bij het opnemen: bijgesneden en in grijswaarden.
+* Het midden van elk kader wordt met de ToF-hoogte en de positie van de drone omgerekend naar
+  cm, net als bij de H. Kaders die de rand van het beeld raken tellen daarvoor niet mee (de
+  plas is maar half in beeld).
+* Kaders binnen `PUDDLE_MERGE_CM` van elkaar zijn dezelfde plas. Pas na `PUDDLE_MIN_HITS`
+  detecties telt een plas, zodat één foute detectie geen plas wordt.
+* Op de grond tekent hij de kaders ook (handig om te testen door de drone boven een plas te
+  houden), maar coördinaten komen er pas in de lucht.
+* Bij elke nieuwe start (en bij *Reset omgeving*) begint de lijst met plassen opnieuw.
+
+**Foto van recht boven (bevestiging).** Vindt de drone tijdens een missie een nieuwe plas,
+dan onderbreekt hij zijn pad: hij vliegt erboven, centreert zich op de verse detecties
+(binnen `PUDDLE_CENTER_TOL_CM`, `PUDDLE_CENTER_STABLE_S` lang) en neemt een foto met de
+onderste camera. Daarna vliegt hij verder vanaf waar hij is. In `photos/` komen per plas twee
+bestanden: `plasN_<tijd>.png` (de foto zelf) en `plasN_<tijd>_detectie.png` (met het kader en
+de coördinaat). De Jetson krijgt een `puddle_photo`-bericht en in de GUI staat 📷 achter de
+plas. Lukt centreren niet binnen `PUDDLE_PHOTO_TIMEOUT_S`, dan neemt hij de foto toch en
+staat de afstand tot het midden in `offset_cm`. Uitzetten: `PUDDLE_PHOTO = False`.
+
+Instellingen in `drone/config.py`: `PUDDLE_MODEL` (ook `.onnx` of een TensorRT-`.engine`),
+`PUDDLE_CONF`, `PUDDLE_IMGSZ` (dezelfde waarde als bij het trainen), `PUDDLE_DEVICE`.
+Zonder `ultralytics` of zonder modelbestand werkt alles zoals vroeger, alleen zonder plassen.
 
 ## Kalibreren (belangrijk vóór de eerste echte vlucht)
 

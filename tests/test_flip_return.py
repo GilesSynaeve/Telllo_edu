@@ -24,7 +24,7 @@ class FlipReturnTests(unittest.TestCase):
         self.app.tello.send_command_with_return.return_value = "ok"
         self.app.follower = Mock()
         self.app.link = Mock()
-        self.app.follower.command.side_effect = lambda fn, *args: fn(*args)
+        self.app.follower.command.side_effect = lambda fn, *args, **kwargs: fn(*args)
         self.app.follower._check_abort.side_effect = self.check_abort
         self.sleep = patch("drone.app.time.sleep").start()
         self.wait = patch.object(self.app.abort, "wait", return_value=False).start()
