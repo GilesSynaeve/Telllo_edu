@@ -2,8 +2,10 @@
 Path recognition: a strip of tape or paper on the floor, seen by the downward
 camera (classic image processing, no model needed).
 
-The strip is the largest long, narrow shape that is clearly darker (PATH_DARK)
-or lighter than the floor. Shorter shapes (H bars, paper puddles) are ignored. Near the drone the strip is fitted with a
+The strip is the long, narrow shape closest to the drone (the image centre) that
+is clearly darker (PATH_DARK) or lighter than the floor. Closest, not largest: a
+thick bar of a big H beside the strip can be larger than the bit of tape in view,
+and following that bar made the drone stop and land on the H right after takeoff. Shorter shapes (H bars, paper puddles) are ignored. Near the drone the strip is fitted with a
 straight line: that gives the point of the strip closest to the drone and its
 local direction, enough to follow a gently curving path.
 """
@@ -15,6 +17,9 @@ import numpy as np
 
 from . import config as cfg
 from .downcam import cm_per_pixel, pixel_to_body
+
+
+PREFER_NEAR_CM = 5   # shapes this much farther than the nearest one are not the strip
 
 
 class PathLine:
@@ -50,7 +55,7 @@ class PathDetector:
         k = max(3, int(round(cfg.PATH_WIDTH_CM[0] / s / 2)) | 1)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((k, k), np.uint8))
         n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-        best = None
+        cands = []
         for i in range(1, n):
             area = stats[i, cv2.CC_STAT_AREA]
             if area * s * s < cfg.PATH_MIN_LENGTH_CM * cfg.PATH_WIDTH_CM[0]:
@@ -71,11 +76,14 @@ class PathDetector:
             around = img[(ring > 0) & (labels != i)]
             if around.size == 0 or abs(float(around.mean()) - inside) < cfg.PATH_MIN_CONTRAST:
                 continue
-            if best is None or area > best[0]:
-                best = (area, pts, width_cm, length_cm, i)
-        if best is None:
+            dist_cm = float(np.min(np.hypot(xs - w / 2, ys - h / 2))) * s
+            cands.append((dist_cm, area, pts, width_cm, length_cm, i))
+        if not cands:
             return None
-        _, pts, width_cm, length_cm, label = best
+        # the strip the drone is on (or nearest to); about as near: the larger one
+        nearest = min(c[0] for c in cands)
+        _, _, pts, width_cm, length_cm, label = max(
+            (c for c in cands if c[0] <= nearest + PREFER_NEAR_CM), key=lambda c: c[1])
         # local fit around the part of the strip closest to the image centre
         c = np.array([w / 2, h / 2], np.float32)
         d = np.linalg.norm(pts - c, axis=1)
