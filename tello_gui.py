@@ -54,7 +54,7 @@ from gui.widgets import (AttitudeIndicator, BatteryBar, Compass, HeightGauge,  #
                          LineChart, Segmented, StatTile, Toast, card)
 
 TICK_MS = 33                    # instruments, camera, top bar (~30 fps)
-PLOT_PATH_S = 0.15              # matplotlib views are slower: redraw less often
+PLOT_PATH_S = 0.5               # matplotlib views are slower: redraw less often (~70 ms each)
 PLOT_3D_S = 0.10
 GROUND_S = 0.25                 # lay a camera frame on the ground map this often
 PLOT_MAP_S = 0.15
@@ -563,8 +563,7 @@ class TelloGUI:
                         tel.get("tof") if app.airborne else None, tel.get("ground"))
         for w in (self.attitude, self.compass, self.height, self.battery):
             w.tick()
-        if self._tick_n % 2 == 0:
-            self.update_camera(tel)
+        self.update_camera(tel)   # redraws only when a new image arrived
 
         if now >= self._next["side"]:
             self._next["side"] = now + 0.2
@@ -854,6 +853,10 @@ class TelloGUI:
         app = self.app
         frame = app.frame_reader.frame if hasattr(app, "frame_reader") else None
         vis = app.latest_vis() if (self.show_dets.get() and app.downvision_enabled) else None
+        source = vis if vis is not None else frame
+        if source is not None and source is getattr(self, "_cam_source", None):
+            return            # same image as on screen: nothing to redraw
+        self._cam_source = source
         self.cam.delete("all")
         if frame is None and vis is None:
             message = ("STA : vidéo indisponible\nNavigation visuelle désactivée\nRevenir en AP pour les caméras"

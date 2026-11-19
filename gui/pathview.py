@@ -378,8 +378,25 @@ class PathView:
             self.ground.set_data(v[0])
             self.ground.set_extent(v[1])
 
+    @staticmethod
+    def _scene_key(s, pose, ground_key, zoom):
+        """Cheap fingerprint of what is drawn: an unchanged view is not redrawn.
+        (A redraw of this figure takes ~70 ms on the GUI thread; the camera view
+        stuttered while it redrew 6x per second for nothing.)"""
+        def tail(points):
+            return (len(points), tuple(round(v) for v in points[-1][:2]) if points else None)
+        marks = tuple((round(m["x"]), round(m["y"])) for key in ("starts", "pads", "puddles")
+                      for m in s.get(key, []))
+        drone = None if pose is None else (round(pose[0] / 2), round(pose[1] / 2), round(pose[2] / 3))
+        return (tuple(tail(p) for p in s["paths"]), tail(s["route"]),
+                tuple(tail(p) for p in s["seen"]), marks, drone, ground_key, zoom)
+
     def update(self, s, pose=None):
         """s: FlightLog.scene(); pose: (x, y, yaw) of the drone in the path frame, or None."""
+        key = self._scene_key(s, pose, getattr(self, "_ground_key", None), getattr(self, "_zoom", None))
+        if key == getattr(self, "_drawn_key", None):
+            return
+        self._drawn_key = key
         self._draw_paths(s["paths"])
         self._draw_marks(s)
         for line in (self.route, self.route_mid):
