@@ -299,7 +299,10 @@ De drone kan op twee manieren vliegen:
   `follow_path` van de Jetson). Zet de drone op of vlak bij het begin van de strook, met de
   neus de kant op die hij moet vliegen. Hij stijgt op, volgt de strook met `PATH_SPEED` en
   stopt waar ze ophoudt (of als hij ze `PATH_LOST_S` seconden niet meer ziet), en landt
-  daar (of op een H die hij onderweg zag). Een plas onderweg onderbreekt het volgen voor de
+  daar. Op een H landt hij ook: een H die hij onderweg duidelijk zag (minstens
+  `HELIPAD_MIN_SIGHTINGS` keer), of een H binnen `HELIPAD_RADIUS_CM` van het einde van de
+  strook. Hij gaat er dan eerst boven hangen, centreert zich en daalt pas dan, net als aan het
+  einde van een missie. Een plas onderweg onderbreekt het volgen voor de
   foto, daarna zoekt hij de strook weer op.
 
 De herkenning (`drone/pathline.py`) zoekt in het beeld van de onderste camera de lange, smalle
