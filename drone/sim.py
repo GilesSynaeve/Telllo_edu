@@ -15,9 +15,18 @@ What it simulates:
 * a path of dark tape on the floor (SIM_PATH) for the path recognition
 * terrain: a few boxes on the floor, so the terrain analysis (barometer minus
   ToF) can be tested
+* puddles (SIM_PUDDLES): shiny, lighter blobs on the floor. A trained model does
+  not recognise drawn puddles, so in the simulator SimPuddleModel finds them in
+  the camera image instead; the rest (coordinates, merging, detour + photo,
+  Jetson messages, ground map) is the real code
+
+Your own floor (path, puddles, H, boxes) goes in a scene file:
+
+    python tello_gui.py --sim --scene sim_scenes/pad_met_plassen.json
 """
 
 import collections
+import json
 import math
 import threading
 import time
@@ -37,6 +46,10 @@ SIM_HELIPAD = (10, -30, 42, 26, 20)
 # Path on the floor: dark tape (world x, y points in cm), width in cm, grey value
 SIM_PATH = ([(-15, 0), (130, 0), (165, 10), (195, 35), (215, 70), (225, 110), (230, 180)],
             5, 55)
+# Puddles: (x, y, length along x, width along y, rotation deg), in cm
+SIM_PUDDLES = [(95, 22, 34, 24, 15),       # beside the tape, before the bend
+               (205, 30, 28, 40, -30)]     # outside the bend
+PUDDLE_GREY = 205           # water reflects the ceiling light: lighter than the floor (~150)
 SIM_BARO_M = 112.0          # barometer altitude of the floor (m above sea level)
 SIM_BARO_NOISE_CM = 6.0
 SIM_IMG_W, SIM_IMG_H = 320, 240
@@ -45,6 +58,60 @@ TEX_HALF = 600              # texture covers -600..600 cm
 RC_SCALE = 0.85             # real cm/s per rc unit (deliberately not exactly RC_CMS_PER_UNIT)
 SETTLE_S = 0.8              # the drone hovers this long after a 'go' before answering ok
 LATENCY_S = 0.15            # video delay
+
+
+def load_scene(path):
+    """
+    Replace the simulated floor by a scene file (JSON, cm, mission frame of the
+    first takeoff: drone at (0, 0), nose along +x, y = left). Every key is optional;
+    a missing key keeps the default, null/[] removes it:
+
+        {"path": [[0, 0], [150, 0], [200, 60]], "path_width": 5, "path_grey": 55,
+         "puddles": [[80, 15, 30, 20, 0], {"x": 180, "y": 40, "l": 40, "w": 25}],
+         "helipad": [10, -30, 42, 26, 20],
+         "terrain": [[40, 90, 70, 130, 30]]}
+    """
+    global SIM_PATH, SIM_PUDDLES, SIM_HELIPAD, SIM_TERRAIN
+    with open(path, encoding="utf-8") as f:
+        scene = json.load(f)
+    if "path" in scene:
+        pts = [tuple(map(float, p[:2])) for p in scene["path"] or []]
+        if len(pts) == 1:
+            raise ValueError("path: minstens 2 punten nodig")
+        width = float(scene.get("path_width", SIM_PATH[1] if SIM_PATH else 5))
+        grey = float(scene.get("path_grey", SIM_PATH[2] if SIM_PATH else 55))
+        SIM_PATH = (pts, width, grey) if pts else None
+    if "puddles" in scene:
+        SIM_PUDDLES = []
+        for p in scene["puddles"] or []:
+            if isinstance(p, dict):
+                p = (p["x"], p["y"], p.get("l", p.get("w", 30)), p.get("w", p.get("l", 30)),
+                     p.get("rot", 0))
+            elif len(p) == 3:          # x, y, diameter
+                p = (p[0], p[1], p[2], p[2], 0)
+            SIM_PUDDLES.append(tuple(float(v) for v in p[:5]) + (0.0,) * (5 - len(p)))
+    if "helipad" in scene:
+        SIM_HELIPAD = tuple(map(float, scene["helipad"])) if scene["helipad"] else None
+    if "terrain" in scene:
+        SIM_TERRAIN = [tuple(map(float, t)) for t in scene["terrain"] or []]
+    print(f"🗺️  Simulator-scène {path}: pad {len(SIM_PATH[0]) if SIM_PATH else 0} punten, "
+          f"{len(SIM_PUDDLES)} plas(sen), H {'ja' if SIM_HELIPAD else 'nee'}, "
+          f"{len(SIM_TERRAIN)} obstakel(s)")
+    return scene
+
+
+def _puddle_mask_xy(ii, jj, px, py, length, width, rot, seed):
+    """Soft 0..1 mask of an irregular (not quite elliptic) puddle; ii/jj = world x/y."""
+    a = math.radians(rot)
+    u = (ii - px) * math.cos(a) + (jj - py) * math.sin(a)
+    v = -(ii - px) * math.sin(a) + (jj - py) * math.cos(a)
+    r = np.hypot(u / (length / 2), v / (width / 2))
+    ang = np.arctan2(v, u)
+    rng = np.random.default_rng(seed)
+    edge = 1.0
+    for k in (2, 3, 5):   # wobbly edge
+        edge = edge + rng.uniform(0.03, 0.09) * np.cos(k * ang + rng.uniform(0, 2 * math.pi))
+    return np.clip((edge - r) / 0.08 + 0.5, 0, 1)
 
 
 def ground_height(x, y):
@@ -118,6 +185,18 @@ class FakeTello:
             h_mask = (abs(u) <= hs / 2) & (abs(v) <= hs / 2) & (
                 (abs(v) >= hs / 2 - bar) | (abs(u) <= bar * 0.45))
             tex[h_mask] = 40
+        for k, (px, py, length, width, rot) in enumerate(SIM_PUDDLES):
+            # only the part of the texture around the puddle (fast)
+            r = max(length, width)
+            i0, i1 = [int(np.clip((v + TEX_HALF) / TEX_RES, 0, n)) for v in (px - r, px + r)]
+            j0, j1 = [int(np.clip((v + TEX_HALF) / TEX_RES, 0, n)) for v in (py - r, py + r)]
+            if i1 <= i0 or j1 <= j0:
+                continue
+            sub_x, sub_y = coords[i0:i1], coords[j0:j1]
+            ii, jj = np.meshgrid(sub_x, sub_y, indexing="ij")
+            m = _puddle_mask_xy(ii, jj, px, py, length, width, rot, seed=k)
+            shine = PUDDLE_GREY + rng.normal(0, 1.5, m.shape)   # smooth: little texture
+            tex[i0:i1, j0:j1] = tex[i0:i1, j0:j1] * (1 - m) + shine * m
         if SIM_PATH:
             pts, width, grey = SIM_PATH
             px = np.array([[(y + TEX_HALF) / TEX_RES, (x + TEX_HALF) / TEX_RES] for x, y in pts],
@@ -348,3 +427,47 @@ class FakeTello:
                 "agx": round(af / 981 * 1000, 1), "agy": round(ar / 981 * 1000, 1),
                 "agz": round(-1000 - self._acc[2] / 981 * 1000, 1),
             }
+
+
+# --- puddle "model" for the simulator --------------------------------------------
+class _List(list):
+    def tolist(self):
+        return list(self)
+
+
+class _Boxes:
+    def __init__(self, xyxy, conf):
+        self.xyxy, self.conf = _List(xyxy), _List(conf)
+
+
+class _Result:
+    def __init__(self, xyxy, conf):
+        self.boxes = _Boxes(xyxy, conf)
+
+
+class SimPuddleModel:
+    """
+    Stand-in for the YOLO model in the simulator: finds the simulated puddles (smooth,
+    lighter than the floor, darker than the white H paper) in the camera image, and
+    answers like Ultralytics (result.boxes.xyxy / .conf). A model trained on real
+    photos does not recognise drawn puddles, this tests everything around the model.
+    """
+    LOW, HIGH = PUDDLE_GREY - 12, PUDDLE_GREY + 10   # floor ~150 (±10), H paper 225
+    MIN_AREA_PX = 150           # smaller bright spots are floor texture
+
+    def predict(self, img, conf=0.25, **_):
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        mask = ((blur >= self.LOW) & (blur <= self.HIGH)).astype(np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        n, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+        xyxy, confs = [], []
+        for i in range(1, n):
+            x, y, w, h, area = stats[i]
+            if area < self.MIN_AREA_PX:
+                continue
+            c = float(min(0.95, 0.6 + 0.35 * area / (w * h)))   # fuller blob = surer
+            if c >= conf:
+                xyxy.append([float(x), float(y), float(x + w), float(y + h)])
+                confs.append(c)
+        return [_Result(xyxy, confs)]

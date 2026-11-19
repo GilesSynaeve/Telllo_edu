@@ -1378,15 +1378,28 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--sim", action="store_true", help="use the simulator instead of a drone")
     parser.add_argument("--record", metavar="DIR", help="save downward frames to DIR (dataset)")
+    parser.add_argument("--scene", metavar="JSON",
+                        help="simulator only: own floor with path, puddles, H, boxes "
+                             "(see sim_scenes/)")
+    parser.add_argument("--sim-model", action="store_true",
+                        help="simulator only: use the trained puddle model instead of the "
+                             "simulator's own puddle finder")
     args = parser.parse_args()
 
     log = LogRedirect(sys.stdout)
     sys.stdout = log
 
+    if args.scene and not args.sim:
+        parser.error("--scene werkt alleen met --sim")
     root = tk.Tk()
+    puddle_model = None
     if args.sim:
-        from drone.sim import FakeTello
-        tello = FakeTello(camera_turn_deg=cfg.CAM_ROTATE_DEG)
+        from drone import sim
+        if args.scene:
+            sim.load_scene(args.scene)
+        tello = sim.FakeTello(camera_turn_deg=cfg.CAM_ROTATE_DEG)
+        if not args.sim_model:
+            puddle_model = sim.SimPuddleModel()
     else:
         from djitellopy import Tello
         Tello.RESPONSE_TIMEOUT = cfg.RESPONSE_TIMEOUT
@@ -1399,7 +1412,7 @@ def main():
                 fn.__defaults__ = (cfg.RESPONSE_TIMEOUT,) + fn.__defaults__[1:]
         tello = Tello()
 
-    app = DroneApp(tello, record_dir=args.record)
+    app = DroneApp(tello, record_dir=args.record, puddle_model=puddle_model)
     try:
         app.start()
     except Exception as e:

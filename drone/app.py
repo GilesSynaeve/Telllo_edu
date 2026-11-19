@@ -40,7 +40,7 @@ class CommandRejected(Exception):
 
 
 class DroneApp:
-    def __init__(self, tello, record_dir=None):
+    def __init__(self, tello, record_dir=None, puddle_model=None):
         self.tello = tello
         self.pose = Pose()
         self.abort = threading.Event()
@@ -56,7 +56,8 @@ class DroneApp:
         self.follower = PathFollower(tello, self.pose, self.abort)
         self.cam = DownCam()
         self.pad_detector = HelipadDetector()
-        self.puddle_detector = PuddleDetector(on_new=self._puddle_found)
+        # puddle_model: an already loaded model (the simulator passes SimPuddleModel)
+        self.puddle_detector = PuddleDetector(on_new=self._puddle_found, model=puddle_model)
         self._photographing = False
         self.pads = []               # H sightings this mission: (t, x, y, size), newest last
         self.path_detector = PathDetector()
