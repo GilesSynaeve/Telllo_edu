@@ -15,8 +15,13 @@ from drone.sim import FakeTello
 def main(local_reference=False):
     # Match the reported flight: take off from the H, rather than put a
     # clipped marker at the edge of the initial camera footprint.
-    original_pad = sim_world.SIM_HELIPAD
-    sim_world.SIM_HELIPAD = (0, 0, *original_pad[2:])
+    original_pads = sim_world.SIM_HELIPADS
+    pad = (0, 0, *original_pads[0][2:])
+    sim_world.SIM_HELIPADS = [pad]
+    # the default tape starts at (-15, 0) and would run straight through an H at
+    # the origin, so the H is not recognised; this scenario does not use the path
+    original_path = sim_world.SIM_PATH
+    sim_world.SIM_PATH = None
     tello = FakeTello(drift=True, wind_cms=1.5, seed=4,
                       camera_turn_deg=cfg.CAM_ROTATE_DEG)
     app = DroneApp(tello)
@@ -73,9 +78,9 @@ def main(local_reference=False):
         assert math.dist(tello.truth()[:2], app.pose.get()[:2]) < 15
         assert math.dist(tello.truth()[:2], before[:2]) < 15, "physical return failed"
         command({"type": "helipad_land"})
-        print("H LAND", "truth", tello.truth(), "H", sim_world.SIM_HELIPAD[:2])
+        print("H LAND", "truth", tello.truth(), "H", pad[:2])
         assert not app.airborne
-        assert math.dist(tello.truth()[:2], sim_world.SIM_HELIPAD[:2]) < 15, "landed away from H"
+        assert math.dist(tello.truth()[:2], pad[:2]) < 15, "landed away from H"
         print("SIM SCENARIO PASS")
     finally:
         if hasattr(app, "mission_thread"):
@@ -84,7 +89,8 @@ def main(local_reference=False):
             app.odometry.stop()
         tello.end()
         cfg.FLIP_RECORD_PATH = original_record_path
-        sim_world.SIM_HELIPAD = original_pad
+        sim_world.SIM_HELIPADS = original_pads
+        sim_world.SIM_PATH = original_path
         log_directory.cleanup()
 
 
