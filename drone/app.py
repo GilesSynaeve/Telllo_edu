@@ -29,7 +29,8 @@ from . import config as cfg
 from .downcam import DownCam, pixel_to_world
 from .helipad import HelipadDetector, HelipadTracker, draw_helipad
 from .jetson_link import JetsonLink
-from .navigator import FlightInterrupted, MissionAborted, MotionEstimate, OdometryLost, PathFollower, Pose, validate_waypoints
+from .navigator import (FlightInterrupted, IdleHold, MissionAborted, MotionEstimate, OdometryLost,
+                        PathFollower, Pose, validate_waypoints)
 from .odometry import Odometry
 from .pad_recovery import PadRecovery
 from .pathline import PathDetector, draw_path, to_body
@@ -85,6 +86,7 @@ class DroneApp:
         self._gen = 0                # +1 on every Land/Abort: older queued commands are void
         self.follower = PathFollower(tello, self.pose, self.abort)
         self.follower.flip_pending = self.commands.flip_pending
+        self.idle_hold = IdleHold()  # keeps the spot between commands (mission thread only)
         self.cam = DownCam()
         self.pad_detector = HelipadDetector()
         self.pad_tracker = HelipadTracker()
@@ -291,14 +293,22 @@ class DroneApp:
     # --------------------------------------------------------- mission thread
     def mission_loop(self):
         while self.running:
+            holding = (cfg.IDLE_HOLD and getattr(self, "airborne", False)
+                       and getattr(self, "state", None) == "flying")
             try:
-                cmd = self.commands.get(timeout=0.5)
+                cmd = self.commands.get(timeout=1.0 / cfg.RC_HZ if holding else 0.5)
             except queue.Empty:
+                if holding and self._idle_step():
+                    continue
                 # Tello lands automatically after 15 s without commands
-                if self.airborne and time.time() - self._last_cmd_time > cfg.KEEPALIVE_INTERVAL:
+                if (getattr(self, "airborne", False)
+                        and time.time() - self._last_cmd_time > cfg.KEEPALIVE_INTERVAL):
                     self.follower.rc(0, 0, 0, 0)
                     self._last_cmd_time = time.time()
                 continue
+            hold = getattr(self, "idle_hold", None)
+            if hold is not None:
+                hold.reset()   # a command moves the drone: hold again where it ends
             try:
                 with self._command_guard():
                     self._active_command = cmd.get("type")
@@ -326,6 +336,25 @@ class DroneApp:
                     self._active_command = None
                     self.commands.dispatching.clear()
             self._last_cmd_time = time.time()
+
+    def _idle_step(self):
+        """One idle-hold control step (mission thread). True when an rc command was sent."""
+        hold = getattr(self, "idle_hold", None)
+        if (hold is None or not getattr(self, "vision_navigation_available", True)
+                or not getattr(self, "downvision_enabled", True)):
+            return False
+        was_disabled = hold.disabled_reason
+        velocity = hold.step(self.pose.snapshot(), time.time())
+        if hold.disabled_reason and not was_disabled:
+            print(f"⚠️  Positie vasthouden UIT voor deze vlucht: {hold.disabled_reason}")
+            self.link.send({"type": "error", "ref": "idle_hold", "error": hold.disabled_reason})
+        if velocity is None:
+            return False
+        push = hold.target is not None and math.hypot(*velocity) >= 1.0 and hold._episode is not None
+        self.follower.send_velocity(velocity[0], velocity[1], 0.0,
+                                    min_units=cfg.RC_MIN_UNITS if push else 0)
+        self._last_cmd_time = time.time()
+        return True
 
     def _begin(self, cmd):
         """Start of a flight command: clear an old abort, unless Land/Abort came after it."""
@@ -633,6 +662,9 @@ class DroneApp:
         self._h_relocalization = []
         self._live_pad = None
         self.pad_tracker.reset()
+        hold = getattr(self, "idle_hold", None)
+        if hold is not None:
+            hold.reset()             # the old hold point belongs to the old frame
         self.path_seen = []
         detector = getattr(self, "puddle_detector", None)
         if detector is not None:
@@ -664,6 +696,9 @@ class DroneApp:
             raise RuntimeError(f"battery too low ({battery}% < {cfg.MIN_BATTERY}%)")
         if cfg.RESET_FRAME_ON_TAKEOFF and not self._pose_set:
             self.reset_frame(carry=True)   # coordinates of this flight start at the drone itself
+        hold = getattr(self, "idle_hold", None)
+        if hold is not None:
+            hold.disabled_reason = None    # a new flight may try again
         self.state = "taking_off"
         print("🚁 Opstijgen...")
         x0, y0, _, _ = self.pose.get()
@@ -711,6 +746,9 @@ class DroneApp:
             self._motion_phase = None
         x, y, _, _ = self.pose.get()
         print(f"✅ In de lucht op {height} cm ({x - x0:+.0f}, {y - y0:+.0f} cm verschoven)")
+        hold = getattr(self, "idle_hold", None)
+        if hold is not None and self.pose.position_valid:
+            hold.reset((x0, y0))   # keep correcting towards the takeoff spot while waiting
 
     def helipad_test(self):
         """Test without a path: take off (if needed), look for the H here and land on it."""
@@ -795,6 +833,7 @@ class DroneApp:
         self._pose_set = False
         self.pose.set(z=0)
         self.state = "idle"
+        self.save_idle_trace()
         self.save_telemetry()
 
     def run_mission(self, msg):
@@ -1539,6 +1578,24 @@ class DroneApp:
             return path
         except Exception as e:
             print(f"⚠️  Positioneerlog niet bewaard: {e}")
+            return None
+
+    def save_idle_trace(self):
+        """Idle-hold steps of the flight (t, x, y, vx_cmd, vy_cmd) as JSON. Never raises."""
+        hold = getattr(self, "idle_hold", None)
+        if hold is None or not hold.trace:
+            return None
+        try:
+            folder = os.path.join(cfg.TELEMETRY_LOG_DIR, "holds")
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, time.strftime("%Y%m%d_%H%M%S_idle_hold.json"))
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump({"columns": ["t", "x", "y", "vx_cmd", "vy_cmd"], "trace": hold.trace,
+                           "disabled_reason": hold.disabled_reason}, stream)
+            hold.trace = []
+            return path
+        except Exception as e:
+            print(f"⚠️  Vasthoudlog niet bewaard: {e}")
             return None
 
     def save_telemetry(self):

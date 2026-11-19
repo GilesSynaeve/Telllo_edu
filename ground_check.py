@@ -12,6 +12,7 @@ short run; results and images go to flight_logs/ground/.
     python ground_check.py video           # front + downward camera: resolution, fps, images
     python ground_check.py snap NAME       # downward image + ToF/attitude + H detection
     python ground_check.py watch 15        # print ToF, yaw, pitch, roll for 15 s
+    python ground_check.py axes ref_forward   # camera axes: ref_forward, forward, ref_left, left
     python ground_check.py info --connection sta --host 192.168.1.77
 """
 
@@ -226,6 +227,71 @@ def cmd_snap(tello, args):
     print(json.dumps(info, indent=2))
 
 
+AXES_STEPS = ("ref_forward", "forward", "ref_left", "left")
+
+
+def cmd_axes(tello, args):
+    """Camera-axis calibration of calibrate_camera.py, one capture per run.
+
+    Steps (hold the drone level at 60-120 cm, motors off):
+      ref_forward  reference image
+      forward      after moving ~20 cm towards the nose (no turning, same height)
+      ref_left     new reference
+      left         after moving ~20 cm to the drone's left
+    The last step writes flight_logs/camera_calibration.json; nothing is applied.
+    """
+    import numpy as np
+    from datetime import datetime, timezone
+
+    from calibrate_camera import _capture, _measure_shift, _warmup_camera
+    from drone.camera_calibration import infer_camera_transform
+    from drone.downcam import DownCam
+
+    step = args.name
+    if step not in AXES_STEPS:
+        raise SystemExit(f"axes: step must be one of {', '.join(AXES_STEPS)}")
+    tello.send_command_with_return("downvision 0", timeout=3)
+    reader = start_video(tello)
+    print("Downvision 1:", tello.send_command_with_return("downvision 1", timeout=3))
+    time.sleep(1.5)
+    camera = DownCam()
+    _warmup_camera(reader, camera)
+    sample = _capture(tello, reader, camera)
+    if not healthy_down(reader.frame):
+        raise RuntimeError("beschadigd camerabeeld: stap opnieuw doen")
+    OUT.mkdir(parents=True, exist_ok=True)
+    np.savez(OUT / f"axes_{step}.npz", img=sample["img"],
+             meta=json.dumps({k: v for k, v in sample.items() if k != "img"}))
+    print(f"Opname '{step}': hoogte {sample['height_cm']:.0f} cm, yaw {sample['yaw_deg']:.0f}, "
+          f"pitch {sample['pitch_deg']:.0f}, roll {sample['roll_deg']:.0f}")
+
+    def load(name):
+        data = np.load(OUT / f"axes_{name}.npz")
+        return dict(json.loads(str(data["meta"])), img=data["img"])
+
+    if step == "forward" or step == "left":
+        measured = _measure_shift(load(f"ref_{step}"), load(step))
+        print(f"Beweging '{step}': beeldverschuiving {measured['shift_px']} px "
+              f"({measured['registration']})")
+        (OUT / f"axes_{step}.json").write_text(json.dumps(measured, indent=2), encoding="utf-8")
+    if step == "left":
+        forward = json.loads((OUT / "axes_forward.json").read_text(encoding="utf-8"))
+        left = json.loads((OUT / "axes_left.json").read_text(encoding="utf-8"))
+        fit = infer_camera_transform(forward["shift_px"], left["shift_px"],
+                                     forward_cm_per_pixel=forward["cm_per_pixel"],
+                                     left_cm_per_pixel=left["cm_per_pixel"])
+        settings = {k: fit[k] for k in ("CAM_ROTATE_DEG", "CAM_FORWARD_SIGN", "CAM_LEFT_SIGN")}
+        proposal = {"created_at_utc": datetime.now(timezone.utc).isoformat(),
+                    "procedure": "manual_motors_stopped_forward_then_left (ground_check axes)",
+                    "applied": False, "proposed_config": settings,
+                    "current_config": {k: getattr(cfg, k) for k in settings},
+                    "fit": {k: v for k, v in fit.items() if k not in settings},
+                    "measurements": {"forward": forward, "left": left}}
+        path = OUT.parent / "camera_calibration.json"
+        path.write_text(json.dumps(proposal, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        print("Voorstel:", settings, "| huidige config:", proposal["current_config"], "->", path)
+
+
 def cmd_watch(tello, args):
     t_end = time.monotonic() + args.seconds
     while time.monotonic() < t_end:
@@ -237,7 +303,7 @@ def cmd_watch(tello, args):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("action", choices=("info", "video", "snap", "watch"))
+    ap.add_argument("action", choices=("info", "video", "snap", "watch", "axes"))
     ap.add_argument("name", nargs="?", default="test", help="snap: name of the image")
     ap.add_argument("--seconds", type=float, default=15, help="watch: duration")
     ap.add_argument("--connection", choices=("ap", "sta"), default="ap")
@@ -251,7 +317,8 @@ def main(argv=None):
     tello = GroundOnlyTello(host=host, network_mode=args.connection)
     try:
         tello.connect()
-        {"info": cmd_info, "video": cmd_video, "snap": cmd_snap, "watch": cmd_watch}[args.action](tello, args)
+        {"info": cmd_info, "video": cmd_video, "snap": cmd_snap, "watch": cmd_watch,
+         "axes": cmd_axes}[args.action](tello, args)
         return 0
     except GroundOnlyError:
         raise

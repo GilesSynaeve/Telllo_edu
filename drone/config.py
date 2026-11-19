@@ -57,6 +57,24 @@ CONNECT_TIMEOUT = 3         # s per SDK handshake attempt; independent of long m
 CONNECT_ATTEMPTS = 2
 CONNECT_STATE_TIMEOUT = 2   # s to receive telemetry after the SDK acknowledgement
 KEEPALIVE_INTERVAL = 5      # s, Tello lands by itself after 15 s without commands
+
+# Hold the spot while hovering between commands (navigator.IdleHold), with the
+# visual odometry. Without it the real drone drifted 40-60 cm in 20 s.
+IDLE_HOLD = True
+IDLE_HOLD_GAIN = 0.8        # 1/s, cm/s towards the spot per cm of error
+IDLE_HOLD_DAMPING = 0.4     # brakes the measured velocity (no overshoot)
+IDLE_HOLD_MAX_CMS = 15      # never faster than this
+IDLE_HOLD_DEADBAND_CM = 3   # closer than this: only brake, don't push
+IDLE_HOLD_MAX_ERR_CM = 40   # further from the spot: switch the hold off for this flight
+IDLE_HOLD_I_GAIN = 0.5      # 1/s^2, extra push per cm of error that lasts (steady drift, wind)
+IDLE_HOLD_I_MAX_CMS = 10    # ... up to this speed
+IDLE_HOLD_I_ZONE_CM = 12    # ... only this close to the spot (further away: plain approach)
+IDLE_HOLD_GROWTH_CM = 15    # error this much above its smallest value of the correction ...
+IDLE_HOLD_GROWTH_S = 2.5    # ... for this long: wrong axes -> switch off for this flight
+IDLE_HOLD_SIGN_S = 1.5      # compare commands and measured movement over this time
+IDLE_HOLD_SIGN_MIN_CMS = 10  # ... only while steering at least this fast on average
+                            # (a gust can beat a small correction, not a firm one)
+IDLE_HOLD_SIGN_BACK_CMS = 4  # moving this fast AGAINST the command: wrong axes -> switch off
 LAND_AT_END = True          # land after the last waypoint (mission can override)
 
 # Navigation mode (the GUI can change it per mission)

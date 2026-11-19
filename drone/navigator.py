@@ -269,6 +269,115 @@ class Pose:
         return bx, by
 
 
+class IdleHold:
+    """
+    Keep the drone above one spot while it waits for the next command.
+
+    Real hover tests (2026-11-12): without this the Tello drifted 40-60 cm in
+    20 s, always forward, because nothing corrected it between commands.
+    step() is pure logic (no drone access): it returns the world velocity to
+    send, (0, 0) to hover still, or None when it does not steer at all.
+    Safety: only on a fresh measured position in the mission frame; switched
+    off for the rest of the flight when the error grows instead of shrinking
+    (wrong camera axes) or gets too large.
+    """
+
+    def __init__(self):
+        self.disabled_reason = None
+        self.trace = []
+        self.reset()
+
+    def reset(self, target=None):
+        self.target = None if target is None else (float(target[0]), float(target[1]))
+        self._episode = None          # (time, error) of the smallest error while correcting
+        self._integral = [0.0, 0.0]   # summed error: steady push against a constant drift
+        self._last_step = None
+        self._window = []             # (time, x, y, vx_cmd, vy_cmd): does the drone obey?
+        self._motion = MotionEstimate()
+
+    def disable(self, reason):
+        self.disabled_reason = reason
+        self.target = None
+
+    def _moves_against_commands(self, now, x, y, v):
+        """
+        Wrong camera axes show at once: the drone is commanded one way and the
+        odometry sees it go the other way. Compare the mean command of the last
+        IDLE_HOLD_SIGN_S with the measured displacement over that time. Wind only
+        slows a correctly steered drone down; it doesn't send it backwards at speed.
+        """
+        self._window.append((now, x, y, v[0], v[1]))
+        while self._window and now - self._window[0][0] > cfg.IDLE_HOLD_SIGN_S:
+            self._window.pop(0)
+        t0, x0, y0 = self._window[0][:3]
+        span = now - t0
+        if span < 0.8 * cfg.IDLE_HOLD_SIGN_S:
+            return False
+        cx = sum(w[3] for w in self._window) / len(self._window)
+        cy = sum(w[4] for w in self._window) / len(self._window)
+        speed = math.hypot(cx, cy)
+        if speed < cfg.IDLE_HOLD_SIGN_MIN_CMS:
+            return False              # hardly steering: nothing to compare
+        along = ((x - x0) * cx + (y - y0) * cy) / speed / span   # cm/s in the commanded direction
+        return along < -cfg.IDLE_HOLD_SIGN_BACK_CMS
+
+    def step(self, snapshot, now):
+        if not cfg.IDLE_HOLD or self.disabled_reason:
+            return None
+        if not snapshot.get("position_valid"):
+            self.target = None        # mission frame lost: an old target means nothing
+            return None
+        sample = snapshot.get("measurement_time")
+        if not snapshot.get("measured") or sample is None or now - sample > 0.35:
+            self._episode = None
+            self._window = []
+            return (0.0, 0.0)         # no fresh measurement: hover, never steer on old data
+        x, y = snapshot["pose"][:2]
+        if self.target is None:
+            self.target = (x, y)
+        velocity = self._motion.observe((x, y), sample)
+        ex, ey = self.target[0] - x, self.target[1] - y
+        err = math.hypot(ex, ey)
+        dt = 0.0 if self._last_step is None else min(max(now - self._last_step, 0.0), 0.3)
+        self._last_step = now
+        if err > cfg.IDLE_HOLD_I_ZONE_CM:
+            self._integral = [0.0, 0.0]   # still on the way: no wind-up, no overshoot
+        elif cfg.IDLE_HOLD_I_GAIN > 0:
+            lim = cfg.IDLE_HOLD_I_MAX_CMS / cfg.IDLE_HOLD_I_GAIN
+            self._integral = [max(-lim, min(lim, i + e * dt))
+                              for i, e in zip(self._integral, (ex, ey))]
+        push = (cfg.IDLE_HOLD_I_GAIN * self._integral[0], cfg.IDLE_HOLD_I_GAIN * self._integral[1])
+        if err > cfg.IDLE_HOLD_MAX_ERR_CM:
+            self.disable(f"{err:.0f} cm van het houdpunt (meer dan {cfg.IDLE_HOLD_MAX_ERR_CM})")
+            return (0.0, 0.0)
+        if err <= cfg.IDLE_HOLD_DEADBAND_CM:
+            self._episode = None
+            v = (push[0] - cfg.IDLE_HOLD_DAMPING * velocity[0],
+                 push[1] - cfg.IDLE_HOLD_DAMPING * velocity[1])
+        else:
+            if self._episode is None or err < self._episode[1]:
+                self._episode = (now, err)
+            since, smallest = self._episode
+            # A gust pushes the drone a few cm back; wrong camera axes push it away
+            # without end. Much further than the best point, for a while: stop.
+            if now - since > cfg.IDLE_HOLD_GROWTH_S and err > smallest + cfg.IDLE_HOLD_GROWTH_CM:
+                self.disable(f"fout groeit van {smallest:.0f} naar {err:.0f} cm: "
+                             "controleer de camera-assen (calibrate_camera.py)")
+                return (0.0, 0.0)
+            v = (cfg.IDLE_HOLD_GAIN * ex + push[0] - cfg.IDLE_HOLD_DAMPING * velocity[0],
+                 cfg.IDLE_HOLD_GAIN * ey + push[1] - cfg.IDLE_HOLD_DAMPING * velocity[1])
+        n = math.hypot(*v)
+        if n > cfg.IDLE_HOLD_MAX_CMS:
+            v = (v[0] * cfg.IDLE_HOLD_MAX_CMS / n, v[1] * cfg.IDLE_HOLD_MAX_CMS / n)
+        if self._moves_against_commands(now, x, y, v):
+            self.disable("drone beweegt tegen de stuurrichting in: "
+                         "controleer de camera-assen (calibrate_camera.py)")
+            return (0.0, 0.0)
+        self.trace.append((round(now, 3), round(x, 1), round(y, 1), round(v[0], 1), round(v[1], 1)))
+        del self.trace[:-3000]
+        return v
+
+
 def validate_waypoints(raw):
     """Convert the Jetson's waypoint list into [(x, y, z), ...] and check the geofence."""
     wps = []
