@@ -1,0 +1,13 @@
+{
+  "_uitleg": "Simulator-vloer: python tello_gui.py --sim --scene sim_scenes/pad_met_plassen.json. Alles in cm, (0, 0) = startplek van de drone, x = vooruit, y = links. path = punten van de tape, puddles = [x, y, lengte, breedte, draaiing in graden], helipad = [x, y, papier, H, draaiing] of null, terrain = [x0, x1, y0, y1, hoogte].",
+  "path": [[-15, 0], [120, 0], [170, -20], [230, -10], [280, 40], [300, 110]],
+  "path_width": 5,
+  "path_grey": 55,
+  "puddles": [
+    [70, 20, 32, 22, 10],
+    [195, -34, 28, 28, 0],
+    [255, 30, 26, 40, -35]
+  ],
+  "helipad": [300, 132, 42, 26, 0],
+  "terrain": []
+}

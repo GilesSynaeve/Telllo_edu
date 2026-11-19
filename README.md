@@ -13,10 +13,11 @@ drone/
     puddles.py        plassen herkennen met een getraind YOLO-model + samenvoegen
     jetson_link.py    UDP/JSON-communicatie met de Jetson
     telemetry.py      alle sensorwaarden over tijd + terreinkaart (barometer − ToF)
-    sim.py            simulator: alles testen zonder drone (`--sim`), met dozen op de vloer
+    sim.py            simulator: alles testen zonder drone (`--sim`), met dozen, tape en plassen op de vloer
 gui/                  onderdelen van de GUI: thema, instrumenten, grondkaart, 3D-weergave, kaart
     keypress.py       toetsenbord-hulp voor tello_combined.py
 json_flights/         opgeslagen vluchten (JSON), te openen met Opslaan/Laden in de GUI
+sim_scenes/           zelfgemaakte vloeren voor de simulator (pad, plassen, H, dozen)
 docs/                 afbeeldingen voor deze README
 ```
 
@@ -71,6 +72,7 @@ pip install -r requirements.txt
 
 ```bash
 python tello_gui.py --sim             # eerst proberen zonder drone
+python tello_gui.py --sim --scene sim_scenes/pad_met_plassen.json   # eigen pad met plassen
 python tello_gui.py                   # echte drone (laptop op de Wi-Fi van de Tello)
 python tello_gui.py --record dataset  # meteen camerabeelden opslaan (dataset voor het model)
 python tello_combined.py              # live vliegen met het toetsenbord
@@ -191,7 +193,8 @@ lange, smalle vorm die duidelijk donkerder (`PATH_DARK = True`) of lichter is da
 papieren plassen niet mee). Ze draait in **elke** vlucht: ook tijdens een geplande route wordt
 het pad dat de drone onder zich ziet op de grondkaart getekend (oranje), en in het
 camerabeeld staat de herkende strook als oranje lijn. Pas `PATH_*` in `drone/config.py` aan
-jullie strook aan (kleur, breedte). De simulator heeft een donkere tape-strook van 5 cm.
+jullie strook aan (kleur, breedte). De simulator heeft een donkere tape-strook van 5 cm, en je
+kunt er zelf een pad met plassen in leggen (zie [Testen in de simulator](#testen-in-de-simulator-eigen-pad-met-plassen)).
 
 Op de **grondkaart** kies je rechtsboven waarop de plassen geprojecteerd worden: het
 **herkende pad** (als er een is, anders de geplande route) of de **geplande route**.
@@ -418,7 +421,9 @@ De Jetson krijgt per plas één `puddle`-bericht met de coördinaten (zie [Proto
    pip install ultralytics
    yolo detect train data=dataset/data.yaml model=yolo11n.pt imgsz=320 epochs=100
    ```
-2. Kopieer `runs/detect/train/weights/best.pt` naar **`models/puddles.pt`**.
+2. Kopieer `runs/detect/<naam>/weights/best.pt` naar **`models/puddles.pt`** (de naam is de
+   map van je training, bv. `train-6`; op Windows `copy runs\detect\train-6\weights\best.pt models\puddles.pt`).
+   Zet `PUDDLE_IMGSZ` in `drone/config.py` op de `imgsz` van die training.
 3. Start de GUI zoals altijd. In het vak met de H-info staat of het model geladen is.
 
 Test het model eerst los op opgenomen beelden, een map of een video:
@@ -454,6 +459,55 @@ staat de afstand tot het midden in `offset_cm`. Uitzetten: `PUDDLE_PHOTO = False
 Instellingen in `drone/config.py`: `PUDDLE_MODEL` (ook `.onnx` of een TensorRT-`.engine`),
 `PUDDLE_CONF`, `PUDDLE_IMGSZ` (dezelfde waarde als bij het trainen), `PUDDLE_DEVICE`.
 Zonder `ultralytics` of zonder modelbestand werkt alles zoals vroeger, alleen zonder plassen.
+
+## Testen in de simulator: eigen pad met plassen
+
+Met `--scene` leg je in de simulator je eigen vloer: een tape-pad, plassen, een H en dozen.
+
+```bash
+python tello_gui.py --sim --scene sim_scenes/pad_met_plassen.json
+```
+
+Druk daarna op *Volg pad op de vloer* (of plan een route met waypoints over de plassen en druk
+op *Start missie*). Op de grondkaart zie je de tape, de plassen (P1, P2, …) en waar ze op het
+pad liggen. Elke plas krijgt een foto in `photos/` en een `puddle`-bericht voor de Jetson,
+net als bij de echte drone.
+
+Een scènebestand is JSON, alles in cm, met (0, 0) = de startplek van de drone, x = vooruit,
+y = links. Elke sleutel is optioneel: wat ontbreekt blijft zoals in `drone/sim.py`, `null` of
+`[]` haalt het weg.
+
+```json
+{
+  "path": [[-15, 0], [120, 0], [170, -20], [230, -10], [280, 40], [300, 110]],
+  "path_width": 5,
+  "path_grey": 55,
+  "puddles": [[70, 20, 32, 22, 10], [195, -34, 28, 28, 0], [255, 30, 26, 40, -35]],
+  "helipad": [300, 132, 42, 26, 0],
+  "terrain": []
+}
+```
+
+* `path`: de punten van de tape (minstens 2), `path_width` de breedte, `path_grey` de
+  grijswaarde (0 = zwart, de vloer is ~150).
+* `puddles`: `[x, y, lengte, breedte, draaiing in graden]`, of `[x, y, diameter]`, of
+  `{"x": .., "y": .., "l": .., "w": .., "rot": ..}`.
+* `helipad`: `[x, y, papier, H, draaiing]`, `terrain`: `[x0, x1, y0, y1, hoogte]` per doos.
+
+Leg een plas niet te ver naast het pad: op ~95 cm hoogte ziet de camera maar ongeveer 40 cm
+links en rechts. Een plas die alleen half in beeld komt, telt niet (zijn midden is niet te
+meten).
+
+**Let op: het getrainde model wordt hier niet getest.** Een model dat op echte foto's getraind
+is, herkent getekende plassen niet. In de simulator zoekt daarom `SimPuddleModel`
+(`drone/sim.py`) de plassen in het camerabeeld (ze zijn glad en lichter dan de vloer). Alles
+daarna is de echte code: coördinaten, samenvoegen, onderbreken voor de foto, de grondkaart en
+de berichten naar de Jetson. Wil je toch je eigen model op de simulatorbeelden laten lopen,
+start dan met `--sim-model`. Het model zelf test je op echte beelden, zie
+[Plassen herkennen](#plassen-herkennen-getraind-model).
+
+Resultaat met `sim_scenes/pad_met_plassen.json` (pad volgen, met wind): 3 van de 3 plassen
+gevonden, op 1 tot 4 cm van hun echte plek, elk met een foto.
 
 ## Kalibreren (belangrijk vóór de eerste echte vlucht)
 
