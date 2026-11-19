@@ -10,6 +10,8 @@ values instead of jumping, and x and y always have the same scale.
 import math
 import tkinter as tk
 
+import numpy as np
+
 import matplotlib
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.colors import LinearSegmentedColormap, Normalize
@@ -84,6 +86,8 @@ class Map3D:
 
     def _init_artists(self):
         ax = self.ax
+        self.position_note = ax.text2D(0.02, 0.97, "", transform=ax.transAxes,
+                                       color=C["warn"], fontsize=9, va="top")
         line = lambda *a, **k: ax.plot([], [], [], *a, **k)[0]
         # axis cross at the start: x red, y green, z blue (like most 3D tools)
         L = 45
@@ -102,6 +106,7 @@ class Map3D:
         self.mission_pts = line("o", color=C["accent"], markersize=5, linestyle="none")
         self.reached = line("o", color=C["ok"], markersize=8, linestyle="none")
         self.trail = line("-", color=C["trail"], linewidth=1.4, alpha=0.9)
+        self.local_trail = line("--", color=C["warn"], linewidth=1.4, alpha=0.9)
         self.drop = line("--", color=C["muted"], linewidth=0.8)
         self.shadow = line("o", color="black", alpha=0.45, markersize=9, linestyle="none")
         self.arms = [line("-", color=C["text"], linewidth=2.5) for _ in range(2)]
@@ -132,6 +137,7 @@ class Map3D:
         self.zoom = min(4.0, max(0.25, self.zoom * (0.85 if event.button == "up" else 1.18)))
 
     def _limits(self, points):
+        points = [p for p in points if all(math.isfinite(v) for v in p)]
         xs = [0.0] + [p[0] for p in points]
         ys = [0.0] + [p[1] for p in points]
         zs = [0.0] + [p[2] for p in points]
@@ -154,11 +160,12 @@ class Map3D:
     # ------------------------------------------------------------- drawing
     @staticmethod
     def _set(artist, pts):
+        # matplotlib >= 3.10 draws Line3D data as arrays (it reads .shape): no plain lists
         if pts:
             xs, ys, zs = zip(*pts)
-            artist.set_data_3d(list(xs), list(ys), list(zs))
+            artist.set_data_3d(np.asarray(xs, float), np.asarray(ys, float), np.asarray(zs, float))
         else:
-            artist.set_data_3d([], [], [])
+            artist.set_data_3d(np.empty(0), np.empty(0), np.empty(0))
 
     def _drone(self, x, y, z, yaw, pitch, roll):
         """Quadcopter X-frame, rotated by yaw and tilted by pitch/roll."""
@@ -210,6 +217,10 @@ class Map3D:
     def update(self, s):
         """s: dict with everything to draw (built by the main window)."""
         x, y, z, yaw = s["pose"]
+        lost = s.get("position_mode") == "lost"
+        self.position_note.set_text(s.get("position_note",
+            "Globale positie onbekend — kaart niet bevestigd"
+            if s["airborne"] and not s.get("position_valid", True) else ""))
         wps, mission = s["waypoints"], s["mission"]
         self._set(self.draft, wps)
         sel = s.get("selected")
@@ -220,10 +231,13 @@ class Map3D:
         self._set(self.mission_pts, mission if show_mission else [])
         self._set(self.reached, mission[:s["reached"]])
         self._set(self.trail, s["trail"])
+        self._set(self.local_trail, s.get("local_trail", []))
         ground = s.get("ground_under") or 0.0
-        self._set(self.drop, [(x, y, ground), (x, y, z)] if z > ground + 1 else [])
-        self._set(self.shadow, [(x, y, ground)] if z > ground + 1 else [])
+        self._set(self.drop, [(x, y, ground), (x, y, z)] if not lost and z > ground + 1 else [])
+        self._set(self.shadow, [(x, y, ground)] if not lost and z > ground + 1 else [])
         self._drone(x, y, z, yaw, s.get("pitch"), s.get("roll"))
+        for artist in self.arms + self.rotors + [self.nose]:
+            artist.set_alpha(0.2 if lost else 1.0)
         pad = s.get("helipad")
         pad_pts = [(pad[0], pad[1], 0)] if pad is not None else []
         self._set(self.pad, pad_pts)
@@ -253,8 +267,8 @@ class Map3D:
             self._labels = [self.ax.text(*pt, text, color=c, fontsize=8)
                             for pt, text, c in labels]
 
-        self._limits(wps + mission + s["trail"][-400:] + [(x, y, z)]
-                     + pad_pts + puddle_pts)
+        self._limits(wps + mission + s["trail"][-400:] + s.get("local_trail", [])[-400:]
+                     + [(x, y, z)] + pad_pts + puddle_pts)
         self.canvas.draw_idle()
 
 
@@ -263,6 +277,7 @@ def legend(parent):
     row = tk.Frame(parent, bg=C["panel"])
     for color, text in ((C["draft"], "gepland pad"), (C["accent"], "actieve missie"),
                         (C["ok"], "bereikt"), (C["trail"], "gevlogen"),
+                        (C["warn"], "relatief spoor"),
                         (C["danger"], "drone (neus)"), (C["cyan"], "H (landingsplaats)"),
                         (C["water"], "plas"),
                         ("#a16207", "terrein hoger"), ("#2563eb", "terrein lager")):

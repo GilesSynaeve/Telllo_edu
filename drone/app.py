@@ -14,6 +14,7 @@ Threads:
     link      receives Jetson messages (jetson_link.py)
 """
 
+import json
 import math
 import os
 import queue
@@ -25,18 +26,46 @@ import traceback
 import cv2
 
 from . import config as cfg
-from .downcam import DownCam, cm_per_pixel, pixel_to_world
-from .helipad import HelipadDetector, draw_helipad
+from .downcam import DownCam, pixel_to_world
+from .helipad import HelipadDetector, HelipadTracker, draw_helipad
 from .jetson_link import JetsonLink
-from .navigator import MissionAborted, PathFollower, Pose, validate_waypoints
-from .pathline import PathDetector, draw_path, to_body
+from .navigator import (FlightInterrupted, IdleHold, MissionAborted, MotionEstimate, OdometryLost,
+                        PathFollower, Pose, validate_waypoints)
 from .odometry import Odometry
+from .pad_recovery import PadRecovery
+from .pathline import PathDetector, draw_path, to_body
 from .puddles import PuddleDetector, draw_puddles
 from .telemetry import Telemetry
+from .video import front_camera_first, station_video
 
 
 class CommandRejected(Exception):
     """Invalid command: reported back, but the drone keeps doing what it did."""
+
+
+class FlightCommandQueue(queue.Queue):
+    """Land first, then flips, then other commands; FIFO within each group."""
+
+    def __init__(self):
+        super().__init__()
+        self.flip_pending = threading.Event()
+        self.dispatching = threading.Event()
+
+    def _put(self, item):
+        priority = {"land": 0, "flip": 1}
+        rank = priority.get(item["type"], 2)
+        index = next((i for i, cmd in enumerate(self.queue)
+                      if priority.get(cmd["type"], 2) > rank), len(self.queue))
+        self.queue.insert(index, item)
+        if item["type"] == "flip":
+            self.flip_pending.set()
+
+    def _get(self):
+        self.dispatching.set()  # covers the gap between dequeue and command execution
+        item = self.queue.popleft()
+        if not any(cmd["type"] == "flip" for cmd in self.queue):
+            self.flip_pending.clear()
+        return item
 
 
 class DroneApp:
@@ -44,6 +73,7 @@ class DroneApp:
         self.tello = tello
         self.pose = Pose()
         self.abort = threading.Event()
+        self._command_lock = threading.RLock()
         self.running = True
         self.state = "idle"          # idle, taking_off, flying, landing, error
         self.airborne = False
@@ -51,20 +81,29 @@ class DroneApp:
         self.current_waypoints = []  # waypoints of the running/last mission (for the GUI)
         self.waypoint_index = -1
         self.waypoints_reached = 0   # reached waypoints of the current mission (for the GUI)
-        self.commands = queue.Queue()
+        self.last_flip_record = None
+        self.commands = FlightCommandQueue()
         self._gen = 0                # +1 on every Land/Abort: older queued commands are void
         self.follower = PathFollower(tello, self.pose, self.abort)
+        self.follower.flip_pending = self.commands.flip_pending
+        self.idle_hold = IdleHold()  # keeps the spot between commands (mission thread only)
         self.cam = DownCam()
         self.pad_detector = HelipadDetector()
+        self.pad_tracker = HelipadTracker()
+        self.pads = []               # H sightings this mission: (t, x, y, size), newest last
+        self.known_pad = None        # confirmed H, retained for the whole coordinate frame
+        self.local_pads = []
+        self.local_known_pad = None
+        self.ever_seen_h = False
+        self._h_relocalization = []
+        self._active_command = None
+        self._live_pad = None       # fresh camera-relative offset, usable without global xy
         # puddle_model: an already loaded model (the simulator passes SimPuddleModel)
         self.puddle_detector = PuddleDetector(on_new=self._puddle_found, model=puddle_model)
         self._photographing = False
-        self.pads = []               # H sightings this mission: (t, x, y, size), newest last
         self.path_detector = PathDetector()
         self.path_obs = None         # (t, near, dir, ends, open ends) of the strip, drone frame cm
         self.path_seen = []          # strip under the drone this frame: (t, x, y), for the GUI
-        self._pad_ref = None         # (t, Helipad, size cm) last full view of the H (for find_center)
-        self._pad_target = None      # (x, y) the landing on the H aims at right now
         self.frame_id = 0            # +1 on every new mission frame (the GUI clears its trail)
         self.frame_link = None       # pose before the last takeoff reset, in the old frame
         self.ground_sample = None    # (t, frame_id, grey, ToF cm, pose): for the GUI's ground map
@@ -78,6 +117,10 @@ class DroneApp:
         self._last_record = 0.0
         self._record_count = 0
         self.downvision_enabled = False
+        self.network_mode = getattr(tello, "network_mode", "ap")
+        self.video_available = True
+        self.vision_navigation_available = True
+        self.video_warning = ""
 
         self.link = JetsonLink(self.submit, cfg.LISTEN_HOST, cfg.LISTEN_PORT,
                                cfg.JETSON_HOST, cfg.JETSON_PORT)
@@ -86,32 +129,90 @@ class DroneApp:
     def start(self):
         self.tello.connect()
         print("Battery level:", self.tello.get_battery())
-        self.tello.streamon()
-        self.set_downvision(True)
-        self.frame_reader = self.tello.get_frame_read()
+        if self.network_mode == "sta":
+            video = station_video(self.tello, getattr(self.tello, "probe_video", False))
+            self.video_available, self.downvision_enabled = video.available, video.downward
+            self.vision_navigation_available = video.available and video.downward
+            self.video_warning, self.frame_reader = video.warning, video.reader
+            if self.video_warning:
+                print(f"⚠️  {self.video_warning}")
+            if not self.vision_navigation_available:
+                self.pose.position_valid = False
+                self.recording = False
+        else:
+            front_camera_first(self.tello)   # a stream started on the downward camera is garbage
+            self.downvision_enabled = False
+            self.tello.streamon()
+            self.set_downvision(True)
+            self.frame_reader = self.tello.get_frame_read()
         self.mission_thread = threading.Thread(target=self.mission_loop, daemon=True)
         self.mission_thread.start()
-        threading.Thread(target=self.detect_loop, daemon=True).start()
-        self.odometry = Odometry(self.tello, self.pose, self.frame_reader, self.cam,
-                                 lambda: self.airborne, lambda: self.downvision_enabled)
-        self.telemetry = Telemetry(self.tello, self.pose, lambda: self.airborne)
+        if self.vision_navigation_available:
+            threading.Thread(target=self.detect_loop, daemon=True).start()
+            self.odometry = Odometry(self.tello, self.pose, self.frame_reader, self.cam,
+                                     lambda: self.airborne, lambda: self.downvision_enabled)
+        self.telemetry = Telemetry(self.tello, self.pose, lambda: self.airborne,
+                                   sensor_only=not self.vision_navigation_available)
         threading.Thread(target=self.status_loop, daemon=True).start()
 
     def set_downvision(self, enabled):
+        self.require_vision("Camera wisselen")
         enabled = bool(enabled)
         if self.downvision_enabled == enabled:
             return
-        self.tello.send_command_with_return(f"downvision {1 if enabled else 0}")
+        response = self.tello.send_command_with_return(f"downvision {1 if enabled else 0}")
+        if str(response).strip().lower() != "ok":
+            raise CommandRejected(f"Camera wisselen mislukt: {response}")
         self.downvision_enabled = enabled
+        self.pad_tracker.reset()
+        self._live_pad = None
         print(f"Downvision {'enabled' if enabled else 'disabled'}")
 
     # ------------------------------------------------- jetson / manual input
     def submit(self, msg):
+        if msg.get("type") == "flip":
+            if (getattr(self, "state", None) == "taking_off"
+                    or getattr(self, "_motion_phase", None) == "takeoff_sdk"):
+                reason = "Salto niet ingepland: opstijgen is nog bezig. Wacht tot de drone stabiel vliegt en klik opnieuw."
+                print(f"⚠️  {reason}")
+                self.link.send({"type": "error", "ref": "flip", "error": reason})
+                return False
+            msg = dict(msg, _submitted=time.monotonic(),
+                       _waiting_for=getattr(self, "_motion_phase", None)
+                       or getattr(self, "_active_command", None))
+            # Interrupt optional RC navigation before copying camera references;
+            # the actual flip remains serialized by the mission worker.
+            self.commands.flip_pending.set()
+        # Click capture/queue insertion and idle landmark relocalization must
+        # be atomic: never move the frame between capturing and queuing a target.
+        try:
+            with self._command_guard():
+                return self._submit(msg)
+        finally:
+            # A rejected/invalid request must not leave navigation interrupted.
+            if msg.get("type") == "flip":
+                with self.commands.mutex:
+                    if not any(cmd["type"] == "flip" for cmd in self.commands.queue):
+                        self.commands.flip_pending.clear()
+
+    def _command_guard(self):
+        if not hasattr(self, "_command_lock"):
+            self._command_lock = threading.RLock()
+        return self._command_lock
+
+    def _submit(self, msg):
         """
         Entry point for every command, from the GUI or the Jetson.
         Runs in the caller's thread: never send flight commands from here.
         """
         t = msg["type"]
+        if t in ("mission", "follow_path", "helipad_land", "flip", "downvision"):
+            try:
+                self.require_vision(t)
+            except CommandRejected as exc:
+                print(f"⚠️  {exc}")
+                self.link.send({"type": "error", "ref": t, "error": str(exc)})
+                return False
         if t in ("abort", "land"):
             if t == "abort":
                 print("🛑 Abort")
@@ -127,8 +228,45 @@ class DroneApp:
         elif t == "ping":
             self.link.send({"type": "pong", "t": msg.get("t")})
         elif t in ("mission", "follow_path", "takeoff", "set_pose", "helipad_land", "reset",
-                   "downvision"):
-            self.commands.put(dict(msg, _gen=self._gen))
+                   "downvision", "flip"):
+            if t == "flip":
+                snapshot = self.pose.snapshot()
+                reference = None
+                odometry = getattr(self, "odometry", None)
+                if odometry is not None:
+                    captured = odometry.capture_flip_reference()
+                    if isinstance(captured, dict):
+                        snapshot, reference = captured["snapshot"], captured["reference"]
+                try:
+                    target = tuple(float(v) for v in msg.get("pose", snapshot["pose"][:3])[:3])
+                except (ValueError, TypeError):
+                    self.link.send({"type": "error", "ref": "flip", "error": "invalid return target"})
+                    return False
+                if len(target) != 3 or not all(math.isfinite(v) for v in target):
+                    self.link.send({"type": "error", "ref": "flip", "error": "invalid return target"})
+                    return False
+                record = {"captured_at": time.time(), "target_cm": target,
+                          "source": "simulation" if getattr(self.tello, "is_simulator", False) is True else "drone",
+                          "yaw_deg": snapshot["pose"][3],
+                          "tracking_valid_at_click": snapshot["tracking_valid"],
+                          "measured_at_click": snapshot["measured"],
+                          "global_position_valid_at_click": snapshot["position_valid"],
+                          "visual_reference_at_click": reference is not None,
+                          "reference_quality": reference.get("quality") if reference else None,
+                          "quality_at_click": snapshot["quality"],
+                          "frame_id": getattr(self, "frame_id", 0), "status": "requested"}
+                self.last_flip_record = record
+                if self.airborne and odometry is not None and reference is None:
+                    reason = "Salto niet ingepland: geen recente camerareferentie voor terugkeer; wacht op positieherkenning."
+                    record.update(status="rejected_before_sdk", error=reason, sdk_accepted=False)
+                    print(f"⚠️  {reason}")
+                    self.link.send({"type": "error", "ref": "flip", "error": reason})
+                    return False
+                # Each queued flip owns its target; later clicks cannot replace it.
+                msg = dict(msg, pose=target, _flip_record=record, _visual_reference=reference)
+            self.commands.put(dict(msg, _gen=self._gen,
+                                   _submitted=msg.get("_submitted", time.monotonic())))
+            return True
         else:
             self.link.send({"type": "error", "ref": t, "error": "unknown message type"})
 
@@ -142,9 +280,10 @@ class DroneApp:
             "type": "status", "state": self.state, "battery": battery,
             "pos": {"x": round(x, 1), "y": round(y, 1), "z": round(z, 1), "yaw": round(yaw, 1)},
             "odometry": self.pose.measured,
+            "position_valid": self.pose.position_valid,
             "mission": self.mission_id, "waypoint_index": self.waypoint_index,
             "helipad": self._helipad_msg(),
-            "puddles": len(self.puddle_detector.puddles()),
+            "puddles": len(self._puddles()),
         })
 
     def status_loop(self):
@@ -155,16 +294,32 @@ class DroneApp:
     # --------------------------------------------------------- mission thread
     def mission_loop(self):
         while self.running:
+            holding = (cfg.IDLE_HOLD and getattr(self, "airborne", False)
+                       and getattr(self, "state", None) == "flying")
             try:
-                cmd = self.commands.get(timeout=0.5)
+                cmd = self.commands.get(timeout=1.0 / cfg.RC_HZ if holding else 0.5)
             except queue.Empty:
+                if holding and self._idle_step():
+                    continue
                 # Tello lands automatically after 15 s without commands
-                if self.airborne and time.time() - self._last_cmd_time > cfg.KEEPALIVE_INTERVAL:
+                if (getattr(self, "airborne", False)
+                        and time.time() - self._last_cmd_time > cfg.KEEPALIVE_INTERVAL):
                     self.follower.rc(0, 0, 0, 0)
                     self._last_cmd_time = time.time()
                 continue
+            hold = getattr(self, "idle_hold", None)
+            if hold is not None:
+                hold.reset()   # a command moves the drone: hold again where it ends
             try:
+                with self._command_guard():
+                    self._active_command = cmd.get("type")
                 self.handle_command(cmd)
+            except FlightInterrupted:
+                # The active navigation ends here. The queued flip runs next;
+                # do not land or resume the interrupted mission afterwards.
+                self.follower.rc(0, 0, 0, 0)
+                self.link.send({"type": "flight_interrupted", "ref": cmd.get("type"),
+                                "reason": "priority_flip"})
             except CommandRejected as e:   # nothing happened: don't land because of it
                 print(f"⚠️  {cmd.get('type')} geweigerd: {e}")
                 self.link.send({"type": "error", "ref": cmd.get("type"), "error": str(e)})
@@ -178,7 +333,29 @@ class DroneApp:
                 self.safe_land()
             finally:
                 self.follower.level = False
+                with self._command_guard():
+                    self._active_command = None
+                    self.commands.dispatching.clear()
             self._last_cmd_time = time.time()
+
+    def _idle_step(self):
+        """One idle-hold control step (mission thread). True when an rc command was sent."""
+        hold = getattr(self, "idle_hold", None)
+        if (hold is None or not getattr(self, "vision_navigation_available", True)
+                or not getattr(self, "downvision_enabled", True)):
+            return False
+        was_disabled = hold.disabled_reason
+        velocity = hold.step(self.pose.snapshot(), time.time())
+        if hold.disabled_reason and not was_disabled:
+            print(f"⚠️  Positie vasthouden UIT voor deze vlucht: {hold.disabled_reason}")
+            self.link.send({"type": "error", "ref": "idle_hold", "error": hold.disabled_reason})
+        if velocity is None:
+            return False
+        push = hold.target is not None and math.hypot(*velocity) >= 1.0 and hold._episode is not None
+        self.follower.send_velocity(velocity[0], velocity[1], 0.0,
+                                    min_units=cfg.RC_MIN_UNITS if push else 0)
+        self._last_cmd_time = time.time()
+        return True
 
     def _begin(self, cmd):
         """Start of a flight command: clear an old abort, unless Land/Abort came after it."""
@@ -189,9 +366,12 @@ class DroneApp:
 
     def handle_command(self, cmd):
         t = cmd["type"]
+        if t in ("mission", "follow_path", "helipad_land", "flip", "downvision"):
+            self.require_vision(t)
         if t == "mission":
             self.run_mission(cmd)
         elif t == "follow_path":
+            self._begin(cmd)
             self.follow_path(cmd)
         elif t == "land":
             self.safe_land()
@@ -205,6 +385,237 @@ class DroneApp:
             self.reset_environment()
         elif t == "downvision":
             self.set_downvision(cmd.get("enabled", True))
+        elif t == "flip":
+            # Perform a flip in the mission thread, without a preparatory climb.
+            self._begin(cmd)
+            record = cmd.get("_flip_record")
+            visual_reference = cmd.get("_visual_reference")
+            direction = cmd.get("dir", "f")
+            if direction not in ("l", "r", "f", "b"):
+                raise CommandRejected("invalid flip direction")
+            # remember previous position so we can return there after the flip
+            try:
+                prev = tuple(self.pose.get())
+            except Exception:
+                prev = None
+            # Pose captured by the GUI at the moment the user clicked Salto.
+            # Prefer this for the return target so the drone goes back to the
+            # same place/height even if the queue waited a bit before running.
+            press_pose = cmd.get("pose")
+            if press_pose is not None:
+                try:
+                    px, py, pz = (float(v) for v in press_pose[:3])
+                    press_pose = (px, py, pz)
+                except Exception:
+                    press_pose = None
+            # The GUI sends the spot where the button was pressed; keep it for
+            # the final recentering, but do not reposition to it before the flip.
+            spot = cmd.get("spot")
+            if spot:
+                try:
+                    press_target = (float(spot[0]), float(spot[1]))
+                except Exception:
+                    press_target = None
+            else:
+                press_target = None
+            try:
+                battery = int(self.tello.get_battery())
+            except Exception:
+                battery = None
+            if battery is not None and battery < cfg.FLIP_MIN_BATTERY:
+                raise CommandRejected(
+                    f"battery too low for flip ({battery}% < {cfg.FLIP_MIN_BATTERY}%)"
+                )
+            # If we're not airborne, take off first so the flip is allowed by the SDK.
+            if not self.airborne:
+                try:
+                    self.takeoff()
+                except MissionAborted:
+                    # takeoff was aborted (Land/Abort): stop handling flip
+                    print("🛑 Flip aborted because takeoff was interrupted")
+                    return
+                # Takeoff may reset the coordinate frame. A ground pose is not
+                # a valid airborne return target in that new frame.
+                prev = tuple(self.pose.get())
+                press_pose = press_target = None
+                visual_reference = None
+                if record is not None:
+                    record["status"] = "ground_target_replaced_after_takeoff"
+                    record["airborne_target_cm"] = prev[:3]
+                    record["tracking_valid_at_click"] = False
+                    record["visual_reference_at_click"] = False
+            # Send at the current altitude as soon as the worker is available.
+            # No extra RC command or artificial pause before the SDK command;
+            # the firmware still decides whether current conditions allow it.
+            self.follower._check_abort()
+            settle_wait = self.follower.settle_before_flip()
+            if record is not None and isinstance(settle_wait, (int, float)):
+                record["rc_settle_s"] = settle_wait
+            self.follower._check_abort()
+            # If the flip command fails we catch the error here and do NOT
+            # re-raise — otherwise the mission loop treats it as a fatal
+            # exception and calls safe_land(), which makes the drone descend.
+            odometry = getattr(self, "odometry", None)
+            if odometry is not None and isinstance(visual_reference, dict) and "frames" in visual_reference:
+                refreshed = odometry.refresh_flip_reference(visual_reference)
+                if isinstance(refreshed, dict):
+                    visual_reference = refreshed
+                    if record is not None:
+                        record["reference_refreshed_before_sdk"] = "before_sdk_frame" in refreshed
+            self.local_pads = []
+            self.local_known_pad = None
+            if odometry is not None:
+                odometry.begin_flip(visual_reference)
+            else:
+                self.pose.position_valid = False
+            flip_error = None
+            response = None
+            try:
+                latency = time.monotonic() - cmd.get("_submitted", time.monotonic())
+                print(f"Salto: SDK-verzoek na {max(0, latency) * 1000:.0f} ms")
+                if record is not None:
+                    record.update(dispatch_latency_ms=max(0, latency) * 1000,
+                                  waiting_for=cmd.get("_waiting_for"))
+                if latency > 0.5 and cmd.get("_waiting_for"):
+                    if cmd["_waiting_for"] == "takeoff_recenter":
+                        print("ℹ️  Startcorrectie onderbroken; salto wachtte op de overgang van RC naar SDK")
+                    else:
+                        print(f"ℹ️  Salto wachtte op: {cmd['_waiting_for']}; "
+                              "een al verstuurde SDK-beweging moet eerst eindigen")
+                # Exactly one request. djitellopy.flip() retries on errors/timeouts,
+                # which can execute a delayed or repeated flip.
+                response = self.tello.send_command_with_return(
+                    f"flip {direction}", timeout=cfg.FLIP_ACK_TIMEOUT_S)
+                if record is not None:
+                    record.update(battery_pct=battery, sdk_response=response)
+                if str(response).strip().lower() != "ok":
+                    raise RuntimeError(f"flip: {response}")
+            except Exception as e:
+                flip_error = str(e)
+                # Log and notify the link, but avoid landing automatically.
+                print(f"❌ Salto geweigerd of onbevestigd: {e} (batterij {battery}%)")
+                if battery is not None and battery < 50:
+                    print("ℹ️  Ryze vereist minstens 50% voor intelligente vliegmodi; "
+                          "een lagere softwaredrempel verandert de firmware niet.")
+                try:
+                    self.link.send({"type": "error", "ref": "flip", "error": str(e)})
+                except Exception:
+                    pass
+            finally:
+                if odometry is not None:
+                    odometry.end_flip()
+            if isinstance(response, str) and response.strip().lower().startswith("error"):
+                # An explicit SDK rejection did not perform the requested flip.
+                # Returning to the click's position (possibly captured during a
+                # prior climb) would introduce an unrelated, unwanted movement.
+                self.follower.rc(0, 0, 0, 0)
+                if odometry is not None:
+                    odometry.finish_flip_recovery()
+                if record is not None:
+                    record.update(status="flip_failed", sdk_accepted=False,
+                                  sdk_error=flip_error, sdk_response=response,
+                                  return_status="not_requested_sdk_refused", recovery_s=0.0)
+                    self._save_flip_record(record)
+                print("ℹ️  Drone weigerde de salto: geen terugkeermanoeuvre gestart; drone houdt positie.")
+                return
+            # Use the same recovery path after success or an SDK error. The GUI
+            # sends xyz, while Pose.get() returns xyz+yaw: normalize to xyz.
+            self.follower.interruptible = True
+            recovery_started = time.monotonic() if record is not None else None
+            try:
+                target = press_pose or prev
+                if press_pose is None and press_target is not None:
+                    target = (*press_target, (prev or self.pose.get())[2])
+                if target:
+                    px, py, pz = target[:3]
+                    return_target = (px, py, float(pz))
+                    if record is not None and not record["tracking_valid_at_click"] and visual_reference is None:
+                        raise CommandRejected("Klikpositie opgeslagen, maar geen bruikbaar "
+                                              "camerareferentie bij de klik; terugkeer niet bevestigd")
+                    # Let video/height measurements catch up before deciding how
+                    # to move. Land/Abort interrupts this wait and all recovery.
+                    deadline = time.monotonic() + cfg.FLIP_TRACK_TIMEOUT_S + cfg.FRAME_LATENCY_S
+                    def return_reference_valid():
+                        return self.pose.position_valid or (visual_reference is not None and
+                                                           self.pose.local_reference_valid)
+
+                    while not (self.pose.measured and return_reference_valid()):
+                        self.follower._check_abort()
+                        if time.monotonic() >= deadline:
+                            detail = odometry.recovery_status() if odometry is not None else {}
+                            reason = detail.get("reason") if isinstance(detail, dict) else None
+                            explanation = {
+                                "not_enough_matching_features": "te weinig vaste herkenningspunten tussen beide beelden",
+                                "not_enough_floor_features": "te weinig zichtbare vloertextuur",
+                                "registered_images_disagree": "beelden komen niet betrouwbaar overeen",
+                                "invalid_height": "geen bruikbare hoogtemeting",
+                                "downward_camera_disabled": "ondercamera staat uit",
+                            }.get(reason, "geen betrouwbare overeenkomst met het opgeslagen beeld")
+                            raise CommandRejected("Klikreferentie opgeslagen, maar vloerbeeld na salto "
+                                                  f"niet herkend ({explanation}); drone blijft hangen")
+                        if self.abort.wait(0.05):
+                            raise MissionAborted()
+                    if record is not None:
+                        record["tracking_wait_s"] = time.monotonic() - recovery_started
+                    print(f"ℹ️  Terug naar vorige plek na salto ({px:.0f}, {py:.0f}, {pz:.0f})")
+                    self.follower.interruptible = True
+                    try:
+                        self.follower._check_abort()
+                        if self.pose.measured:
+                            # RC recovery avoids the SDK settling wait and the
+                            # stop between coarse and fine positioning.
+                            arrived = self.follower.hold_position(
+                                return_target, max_speed=cfg.FLIP_RETURN_RC_SPEED,
+                                gain=cfg.FLIP_RETURN_GAIN,
+                                tolerance_cm=cfg.FLIP_RETURN_TOL_CM,
+                                timeout_s=cfg.FLIP_RETURN_TIMEOUT_S,
+                                settle_s=cfg.FLIP_RETURN_SETTLE_S,
+                                damping=cfg.FLIP_RETURN_DAMPING,
+                                max_vertical_speed=cfg.FLIP_RETURN_Z_SPEED,
+                                z_tolerance_cm=cfg.FLIP_RETURN_Z_TOL_CM,
+                                **({"allow_local_reference": True} if visual_reference is not None else {}))
+                            current = self.pose.get()
+                            xy_error = math.hypot(current[0] - px, current[1] - py)
+                            z_error = abs(current[2] - pz)
+                            confirmed = (arrived is True and self.pose.measured and return_reference_valid()
+                                         and xy_error < cfg.FLIP_RETURN_TOL_CM
+                                         and z_error < cfg.FLIP_RETURN_Z_TOL_CM)
+                            if record is not None:
+                                record.update(status="confirmed" if confirmed else "not_confirmed",
+                                              return_reference="click_image" if visual_reference is not None else "global",
+                                              final_estimate_cm=current[:3], xy_error_cm=xy_error,
+                                              z_error_cm=z_error)
+                                control = getattr(self.follower, "last_hold_result", None)
+                                if isinstance(control, dict):
+                                    record["return_control"] = control
+                            label = "Salto terugkeer" if flip_error is None else "Positieherstel na geweigerde salto"
+                            print(f"{label} {'bevestigd' if confirmed else 'NIET bevestigd'}: "
+                                  f"xy {xy_error:.1f} cm, hoogte {z_error:.1f} cm")
+                    finally:
+                        self.follower.interruptible = False
+                    if not self.pose.measured:
+                        print("⚠️  Terugkeer na salto: geen visuele odometrie; "
+                              "werkelijke horizontale positie niet bevestigd")
+            except (MissionAborted, FlightInterrupted):
+                if record is not None:
+                    record["status"] = "interrupted"
+                raise
+            except Exception as e:
+                if record is not None:
+                    record.update(status="not_confirmed", error=str(e))
+                print(f"⚠️  Terugkeer na salto mislukt: {e}")
+                self.link.send({"type": "error", "ref": "flip_return", "error": str(e)})
+            finally:
+                self.follower.interruptible = False
+                if odometry is not None:
+                    odometry.finish_flip_recovery()
+                if record is not None:
+                    record["recovery_s"] = time.monotonic() - recovery_started
+                    record["sdk_accepted"] = flip_error is None
+                    record["return_status"] = record["status"]
+                    if flip_error is not None:
+                        record.update(status="flip_failed", sdk_error=flip_error)
+                    self._save_flip_record(record)
         elif t == "set_pose":
             if self.airborne:
                 raise CommandRejected("set_pose is only allowed on the ground")
@@ -212,11 +623,27 @@ class DroneApp:
             self._pose_set = True
             self.link.send({"type": "ack", "ref": t})
 
+    def _save_flip_record(self, record):
+        """Persist the click target and measured result after flight commands."""
+        try:
+            path = os.path.abspath(cfg.FLIP_RECORD_PATH)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            odometry = getattr(self, "odometry", None)
+            if odometry is not None:
+                diagnostic = odometry.save_flip_diagnostics(os.path.dirname(path))
+                if isinstance(diagnostic, dict):
+                    record["registration"] = diagnostic
+            with open(path + ".tmp", "w", encoding="utf-8") as stream:
+                json.dump(record, stream, indent=2, allow_nan=False)
+            os.replace(path + ".tmp", path)
+        except (OSError, ValueError) as e:
+            print(f"Salto-opname kon niet worden opgeslagen: {e}")
+
     def reset_frame(self, carry=False):
         """
         New mission frame from where the drone stands now: origin here, x = where
         the nose (front camera) points, y = left. Everything measured in the old
-        frame (H sightings, terrain map, GUI trail) no longer fits, so it goes too.
+        frame (H sightings, puddles, terrain map, GUI trail) no longer fits, so it goes too.
 
         carry: the drone was not moved by hand since it landed (takeoff), so the
         old pose says where the new frame lies in the old one. The GUI's path view
@@ -224,9 +651,25 @@ class DroneApp:
         """
         self.frame_link = self.pose.get() if carry else None
         self.pose.reset()
+        if not getattr(self, "vision_navigation_available", True):
+            self.pose.position_valid = False
+        if hasattr(self, "odometry"):
+            self.odometry.reset_tracking()
         self.pads = []
+        self.known_pad = None
+        self.local_pads = []
+        self.local_known_pad = None
+        self.ever_seen_h = False
+        self._h_relocalization = []
+        self._live_pad = None
+        self.pad_tracker.reset()
+        hold = getattr(self, "idle_hold", None)
+        if hold is not None:
+            hold.reset()             # the old hold point belongs to the old frame
         self.path_seen = []
-        self.puddle_detector.reset()
+        detector = getattr(self, "puddle_detector", None)
+        if detector is not None:
+            detector.reset()
         if hasattr(self, "telemetry"):
             self.telemetry.terrain.reset()
         self.frame_id += 1
@@ -254,43 +697,102 @@ class DroneApp:
             raise RuntimeError(f"battery too low ({battery}% < {cfg.MIN_BATTERY}%)")
         if cfg.RESET_FRAME_ON_TAKEOFF and not self._pose_set:
             self.reset_frame(carry=True)   # coordinates of this flight start at the drone itself
+        hold = getattr(self, "idle_hold", None)
+        if hold is not None:
+            hold.disabled_reason = None    # a new flight may try again
         self.state = "taking_off"
         print("🚁 Opstijgen...")
         x0, y0, _, _ = self.pose.get()
         self.airborne = True  # odometry measures the drift during takeoff too
+        self._motion_phase = "takeoff_sdk"
         try:
             self.tello.takeoff()
         except Exception:
             self.airborne = False
             raise
+        finally:
+            self._motion_phase = None
         height = self.read_height(default=80)
         self.pose.set(z=height)
+        if not getattr(self, "vision_navigation_available", True):
+            self.pose.position_valid = False
+            self.state = "flying"
+            print("En vol — télémétrie uniquement, position horizontale non mesurée.")
+            return
         self.state = "flying"
+        # Climbing changes image scale and can temporarily interrupt tracking.
+        # Allow fresh level frames to arrive before deciding whether to recenter.
+        self.follower.interruptible = True
+        self._motion_phase = "takeoff_recenter"
+        try:
+            deadline = time.monotonic() + 0.8
+            while not self.pose.measured and time.monotonic() < deadline:
+                self.follower._check_abort()
+                if self.abort.wait(0.05):
+                    raise MissionAborted()
+            if cfg.TAKEOFF_RECENTER and self.pose.measured and self.pose.position_valid:
+                x, y, _, _ = self.pose.get()
+                if math.hypot(x - x0, y - y0) > 3:
+                    print("↩️  Terug boven de startplek")
+                    arrived = self.follower.hold_position(
+                        (x0, y0, height), max_speed=12, gain=0.8, damping=0.4,
+                        tolerance_cm=3, timeout_s=3, max_vertical_speed=0,
+                        max_error_growth_cm=4)
+                    self.save_hold_trace("takeoff_recenter")
+                    if not arrived:
+                        print("⚠️  Startplek niet bereikt: correctie gestopt. "
+                              "Controleer camerakalibratie als de drone de verkeerde kant op corrigeert.")
+        finally:
+            self.follower.interruptible = False
+            self._motion_phase = None
         x, y, _, _ = self.pose.get()
         print(f"✅ In de lucht op {height} cm ({x - x0:+.0f}, {y - y0:+.0f} cm verschoven)")
-        if (cfg.TAKEOFF_RECENTER and self.pose.measured
-                and math.hypot(x - x0, y - y0) > cfg.TAKEOFF_RECENTER_TOL_CM):
-            print("↩️  Terug boven de startplek")
-            self.follower.hold_position((x0, y0, height), tol=cfg.TAKEOFF_RECENTER_TOL_CM,
-                                        timeout=cfg.TAKEOFF_RECENTER_TIMEOUT_S,
-                                        settle=cfg.TAKEOFF_RECENTER_SETTLE_S)
-            x, y, _, _ = self.pose.get()
-            print(f"🎯 Boven de startplek ({x - x0:+.0f}, {y - y0:+.0f} cm)")
+        hold = getattr(self, "idle_hold", None)
+        if hold is not None and self.pose.position_valid:
+            hold.reset((x0, y0))   # keep correcting towards the takeoff spot while waiting
 
     def helipad_test(self):
         """Test without a path: take off (if needed), look for the H here and land on it."""
-        self.pads = []
+        self.require_vision("Atterrissage H")
         self.takeoff()
         x, y, _, _ = self.pose.get()
+        local = not self.pose.position_valid and self.pose.local_reference_valid
+        remembered = self.seen_helipad(local=local)
+        live = self._live_pad
+        visible = live is not None and time.time() - live[0] < cfg.HELIPAD_CONTROL_MAX_AGE_S
+        if not visible and remembered is not None and (self.pose.position_valid or local) and self.pose.measured:
+            print(f"H onthouden op ({remembered[0]:.0f}, {remembered[1]:.0f})")
+            try:
+                if local:
+                    distance = math.hypot(remembered[0] - x, remembered[1] - y)
+                    timeout = min(cfg.HELIPAD_APPROACH_MAX_S, max(cfg.FINE_TIMEOUT_S, distance / 20 * 2 + 3))
+                    arrived = self.follower.hold_position((*remembered, self.pose.get()[2]),
+                                                         allow_local_reference=True,
+                                                         damping=cfg.HELIPAD_DAMPING, timeout_s=timeout)
+                    if not arrived:
+                        live = self._live_pad
+                        if live is None or time.time() - live[0] >= cfg.HELIPAD_CONTROL_MAX_AGE_S:
+                            raise CommandRejected("Lokale H-positie niet bereikt en H niet in beeld: drone blijft hangen")
+                else:
+                    self.follower.move_to((*remembered, self.pose.get()[2]), cfg.DEFAULT_SPEED,
+                                          require_tracking=True)
+            except OdometryLost as e:
+                raise CommandRejected("Positie kwijt: terugkeer naar onthouden H gestopt") from e
+            x, y = remembered
         print("🔎 H-test: zoeken naar een H onder de drone")
         found = False
+        self.follower.interruptible = True
         try:
             found = self.land_on_helipad((x, y))
         except MissionAborted:
-            found = True   # Land button / abort: just land
-        except Exception as e:
-            print(f"⚠️  Landen op de H mislukt ({e}), gewoon landen")
-        self.safe_land(None if found else (x, y), helipad=False)
+            self.safe_land(helipad=False)
+            return
+        finally:
+            self.follower.interruptible = False
+        if not found:
+            raise CommandRejected("H niet bevestigd: geen automatische landing; "
+                                  "drone blijft hangen. Landen (L) voor hier landen.")
+        self.safe_land(helipad=False)
 
     def safe_land(self, spot=None, helipad=True):
         """
@@ -332,8 +834,11 @@ class DroneApp:
         self._pose_set = False
         self.pose.set(z=0)
         self.state = "idle"
+        self.save_idle_trace()
+        self.save_telemetry()
 
     def run_mission(self, msg):
+        self.require_vision("Mission")
         # check everything before taking off; a bad mission must not land a hovering drone
         try:
             waypoints = validate_waypoints(msg["waypoints"])
@@ -351,7 +856,6 @@ class DroneApp:
         self.current_waypoints = waypoints
         self.waypoints_reached = 0
         self._begin(msg)
-        self.pads = []
         print(f"🗺️  Mission {self.mission_id}: {len(waypoints)} waypoints @ {speed} cm/s")
         self.link.send({"type": "ack", "ref": "mission", "id": self.mission_id,
                         "waypoints": len(waypoints)})
@@ -374,6 +878,7 @@ class DroneApp:
                             "pos": {"x": round(x, 1), "y": round(y, 1), "z": round(z, 1)}})
 
         try:
+            self.follower.interruptible = True
             self.follower.interrupt = self.puddle_detour
             self.follower.fly(waypoints, speed, on_waypoint,
                               mode=msg.get("nav_mode"), fine=msg.get("fine"))
@@ -387,6 +892,7 @@ class DroneApp:
             self.safe_land()
             return
         finally:
+            self.follower.interruptible = False
             self.follower.interrupt = None
             self.waypoint_index = -1
 
@@ -420,13 +926,13 @@ class DroneApp:
         self.mission_id = msg.get("id")
         self.current_waypoints = []
         self.waypoints_reached = 0
-        self._begin(msg)
         self.pads = []
         print(f"〰️  Pad volgen ({self.mission_id}) @ {speed} cm/s")
         self.link.send({"type": "ack", "ref": "follow_path", "id": self.mission_id})
         try:
             self.takeoff()
             x0, y0, z0, _ = self.pose.get()
+            self.follower.interruptible = True   # a Salto click may end the path
             reason = self._follow_strip(speed, bool(msg.get("reverse", False)))
         except MissionAborted:
             print("🛑 Pad volgen afgebroken")
@@ -435,6 +941,7 @@ class DroneApp:
             self.safe_land()
             return
         finally:
+            self.follower.interruptible = False
             self.follower.rc(0, 0, 0, 0)
         print(f"🏁 Pad gevolgd: {reason}")
         self.link.send({"type": "path_done", "id": self.mission_id, "reason": reason,
@@ -495,13 +1002,21 @@ class DroneApp:
             f.rc(clamp(-vl / cfg.RC_CMS_PER_UNIT), clamp(vf / cfg.RC_CMS_PER_UNIT), 0, clamp(yv))
             time.sleep(period)
 
-    def seen_helipad(self):
+    def seen_helipad(self, local=False):
         """
         Position of the H seen during this mission, or None. The sightings are
         grouped by place; the place seen most often (at least HELIPAD_MIN_SIGHTINGS
         times, so one wrong detection doesn't count) wins, its median is returned.
         """
-        pads = list(self.pads)
+        pads = list(getattr(self, "local_pads", []) if local else self.pads)
+        known = getattr(self, "local_known_pad", None) if local else self.known_pad
+        if known is not None:
+            near = [p for p in pads if math.hypot(p[1] - known[0], p[2] - known[1]) < 30]
+            if len(near) >= cfg.HELIPAD_MIN_SIGHTINGS:
+                xs, ys = sorted(p[1] for p in near), sorted(p[2] for p in near)
+                known = (xs[len(xs) // 2], ys[len(ys) // 2])
+                setattr(self, "local_known_pad" if local else "known_pad", known)
+            return known
         best = []
         for _, x, y, _ in pads:
             near = [p for p in pads if math.hypot(p[1] - x, p[2] - y) < 30]
@@ -511,7 +1026,9 @@ class DroneApp:
             return None
         xs = sorted(p[1] for p in best)
         ys = sorted(p[2] for p in best)
-        return xs[len(xs) // 2], ys[len(ys) // 2]
+        known = (xs[len(xs) // 2], ys[len(ys) // 2])
+        setattr(self, "local_known_pad" if local else "known_pad", known)
+        return known
 
     def seen_helipads(self):
         """Every place an H was seen at least HELIPAD_MIN_SIGHTINGS times: [(x, y), ...]."""
@@ -532,12 +1049,54 @@ class DroneApp:
         pad = self.seen_helipad()
         return None if pad is None else {"x": round(pad[0], 1), "y": round(pad[1], 1)}
 
+    def _puddles(self):
+        detector = getattr(self, "puddle_detector", None)
+        return detector.puddles() if detector is not None else []
+
     def _puddles_msg(self):
-        return [p.to_msg() for p in self.puddle_detector.puddles()]
+        return [p.to_msg() for p in self._puddles()]
 
     def _puddle_found(self, puddle):
         """A new puddle is confirmed (puddle thread): tell the Jetson."""
         self.link.send(dict(puddle.to_msg(), type="puddle", mission=self.mission_id))
+
+    def _try_h_relocalization(self, t_frame, x, y):
+        """Recover the original frame only from a previously known, stable H.
+
+        A newly discovered local H cannot establish where the flight began.
+        Don't shift coordinates while a flight command is using a saved target.
+        """
+        if (getattr(self, "_active_command", None) is not None or self.known_pad is None
+                or self.pose.position_valid or not self.pose.measured
+                or not self.pose.local_reference_valid or not hasattr(self, "odometry")):
+            self._h_relocalization = []
+            return
+        delta = (self.known_pad[0] - x, self.known_pad[1] - y)
+        if math.hypot(*delta) > cfg.HELIPAD_RELOCALIZE_MAX_CM:
+            self._h_relocalization = []
+            return
+        samples = getattr(self, "_h_relocalization", [])
+        samples = [s for s in samples if t_frame - s[0] < 0.7]
+        if samples and t_frame <= samples[-1][0]:
+            return
+        samples.append((t_frame, *delta))
+        self._h_relocalization = samples[-cfg.HELIPAD_MIN_SIGHTINGS:]
+        if len(self._h_relocalization) < cfg.HELIPAD_MIN_SIGHTINGS:
+            return
+        samples = self._h_relocalization
+        dx = sorted(s[1] for s in samples)[len(samples) // 2]
+        dy = sorted(s[2] for s in samples)[len(samples) // 2]
+        if max(math.hypot(s[1] - dx, s[2] - dy) for s in samples) > cfg.HELIPAD_RELOCALIZE_SPREAD_CM:
+            return
+        with self._command_guard():
+            if (self._active_command is not None or self.commands.dispatching.is_set()
+                    or not self.commands.empty()):
+                return
+            if self.odometry.relocalize_from_pad(dx, dy) is True:
+                print("📍 Globale positie hersteld via de eerder onthouden H")
+                self.local_pads = []
+                self.local_known_pad = None
+                self._h_relocalization = []
 
     def land_on_seen_helipad(self, first_wp, speed):
         """
@@ -545,6 +1104,7 @@ class DroneApp:
         seen during the whole flight (helipad_search): fly back to the first
         waypoint and land there.
         """
+        self.require_vision("Atterrissage H")
         z = self.pose.get()[2]
         pad = self.seen_helipad()
         if pad is not None:
@@ -581,48 +1141,64 @@ class DroneApp:
         f.rc(0, 0, 0, 0)
         tx, ty = puddle.x, puddle.y
         x, y, z, _ = self.pose.get()
+        if not (self.pose.measured and self.pose.position_valid):
+            # Never fly to remembered coordinates without a measured position.
+            print(f"⚠️  Plas {puddle.id}: positie niet gemeten, geen foto-omweg")
+            return
+        g = cfg.GEOFENCE
+        if not (g["x"][0] <= tx <= g["x"][1] and g["y"][0] <= ty <= g["y"][1]):
+            print(f"⚠️  Plas {puddle.id} buiten de geofence: geen foto-omweg")
+            return
         print(f"📷 Plas {puddle.id}: erboven centreren voor een foto "
               f"({math.hypot(tx - x, ty - y):.0f} cm verder)")
-        if not self.pose.measured:
-            # no odometry: one 'go' move to the puddle, no fine centring possible
-            f.move_to((tx, ty, z), cfg.DEFAULT_SPEED)
-            time.sleep(1.0)
-        else:
-            period = 1.0 / cfg.RC_HZ
-            deadline = time.time() + cfg.PUDDLE_PHOTO_TIMEOUT_S
-            t_seen = time.time() - cfg.FRAME_LATENCY_S
-            good_since = None
-            try:
-                while time.time() < deadline:
-                    f._check_abort()
-                    new = self.puddle_detector.sighting_near(tx, ty, t_seen)
-                    if new:   # fresh measurement of the puddle (smoothed a little)
-                        t_seen = new[0]
-                        tx, ty = 0.5 * tx + 0.5 * new[1], 0.5 * ty + 0.5 * new[2]
-                    x, y, z, _ = self.pose.get()
-                    ex, ey = tx - x, ty - y
-                    err = math.hypot(ex, ey)
-                    fresh = time.time() - t_seen < 1.0
-                    if err < cfg.PUDDLE_CENTER_TOL_CM and fresh:
-                        good_since = good_since or time.time()
-                        if time.time() - good_since >= cfg.PUDDLE_CENTER_STABLE_S:
-                            break
-                    else:
-                        good_since = None
-                    vx, vy = cfg.RC_GAIN * ex, cfg.RC_GAIN * ey
-                    n = math.hypot(vx, vy)
-                    if n > 20:
-                        vx, vy = vx * 20 / n, vy * 20 / n
-                    push = err > cfg.PUDDLE_CENTER_TOL_CM
-                    f.send_velocity(vx, vy, 0, min_units=cfg.RC_MIN_UNITS if push else 0)
+        period = 1.0 / cfg.RC_HZ
+        deadline = time.time() + cfg.PUDDLE_PHOTO_TIMEOUT_S
+        t_seen = time.time() - cfg.FRAME_LATENCY_S
+        good_since = None
+        first_err = None
+        try:
+            while time.time() < deadline:
+                f._check_abort()
+                if not (self.pose.measured and self.pose.position_valid):
+                    # tracking lost while centring: hover, never steer on an old error
+                    f.rc(0, 0, 0, 0)
+                    good_since = None
                     time.sleep(period)
+                    continue
+                new = self.puddle_detector.sighting_near(tx, ty, t_seen)
+                if new:   # fresh measurement of the puddle (smoothed a little)
+                    t_seen = new[0]
+                    tx, ty = 0.5 * tx + 0.5 * new[1], 0.5 * ty + 0.5 * new[2]
+                x, y, z, _ = self.pose.get()
+                ex, ey = tx - x, ty - y
+                err = math.hypot(ex, ey)
+                first_err = err if first_err is None else first_err
+                if err > first_err + 15:
+                    # moving away: wrong camera signs/rotation; stop instead of wandering off
+                    print(f"⚠️  Plas {puddle.id}: drone gaat van de plas weg, foto-omweg gestopt; "
+                          "controleer de camerakalibratie")
+                    return
+                fresh = time.time() - t_seen < 1.0
+                if err < cfg.PUDDLE_CENTER_TOL_CM and fresh:
+                    good_since = good_since or time.time()
+                    if time.time() - good_since >= cfg.PUDDLE_CENTER_STABLE_S:
+                        break
                 else:
-                    print(f"ℹ️  Plas {puddle.id}: na {cfg.PUDDLE_PHOTO_TIMEOUT_S}s niet "
-                          f"gecentreerd, foto toch genomen")
-            finally:
-                f.rc(0, 0, 0, 0)
-            puddle.x, puddle.y = tx, ty   # the last measurements, from straight above
-            time.sleep(cfg.FRAME_LATENCY_S + 0.15)   # a frame taken after stopping
+                    good_since = None
+                vx, vy = cfg.RC_GAIN * ex, cfg.RC_GAIN * ey
+                n = math.hypot(vx, vy)
+                if n > 20:
+                    vx, vy = vx * 20 / n, vy * 20 / n
+                push = err > cfg.PUDDLE_CENTER_TOL_CM
+                f.send_velocity(vx, vy, 0, min_units=cfg.RC_MIN_UNITS if push else 0)
+                time.sleep(period)
+            else:
+                print(f"ℹ️  Plas {puddle.id}: na {cfg.PUDDLE_PHOTO_TIMEOUT_S}s niet "
+                      f"gecentreerd, foto toch genomen")
+        finally:
+            f.rc(0, 0, 0, 0)
+        puddle.x, puddle.y = tx, ty   # the last measurements, from straight above
+        time.sleep(cfg.FRAME_LATENCY_S + 0.15)   # a frame taken after stopping
         x, y, _, _ = self.pose.get()
         self.save_puddle_photo(puddle, math.hypot(puddle.x - x, puddle.y - y))
 
@@ -667,17 +1243,22 @@ class DroneApp:
             while time.time() < t_end:
                 self.follower._check_abort()
                 found = self._pad_near(end_xy, 0)
-                if found:
+                live = self._live_pad
+                if live is not None and time.time() - live[0] < 0.4:
+                    x, y, _, _ = self.pose.get()
+                    return (live[0], x + live[1], y + live[2], live[3])
+                if found and time.time() - found[0] < 0.4:
                     return found
                 x, y, z, _ = self.pose.get()
                 vz = 0
-                if climb_cms and z < cfg.HELIPAD_SEARCH_HEIGHT_CM and time.time() < t_climb:
+                if (climb_cms and self.pose.measured and self.pose.position_valid
+                        and z < cfg.HELIPAD_SEARCH_HEIGHT_CM and time.time() < t_climb):
                     vz = climb_cms
                     t_end = time.time() + cfg.HELIPAD_SEARCH_S   # look once up there
                 # stay above the end point (otherwise the drone drifts away while looking);
                 # without odometry the position doesn't update: steering would fly away
                 vx, vy = (cfg.RC_GAIN * (e - c) for e, c in zip(end_xy, (x, y)))
-                if not self.pose.measured:
+                if not self.pose.measured or not self.pose.position_valid:
                     vx = vy = 0.0
                 n = math.hypot(vx, vy)
                 if n > 15:
@@ -693,84 +1274,132 @@ class DroneApp:
         Look for an H near the end point, steer above its centre and descend.
         The H position is measured again in every camera frame, so the drone
         keeps correcting while it comes down. Returns False when there is no H
-        (nothing done), True when the drone is low above the H (or gave up
-        there) and only the final 'land' is left.
+        (nothing done), True only when the drone is low and stable above the H
+        and only the final 'land' is left.
         """
+        self.require_vision("Atterrissage H")
         f = self.follower
         sighting = self._pad_near(end_xy, 0)
-        if sighting is None:   # not seen on the way: hover at the end point and look
+        if sighting is None or time.time() - sighting[0] > 0.4:
             sighting = self._look_for_pad(end_xy, 0.0)
-        if sighting is None and self.pose.get()[2] < cfg.HELIPAD_SEARCH_HEIGHT_CM - 15:
+        if (sighting is None and self.pose.measured and self.pose.position_valid
+                and self.pose.get()[2] < cfg.HELIPAD_SEARCH_HEIGHT_CM - 15):
             # higher up the camera sees a bigger part of the floor
             print(f"🔎 Geen H in beeld: stijgen naar {cfg.HELIPAD_SEARCH_HEIGHT_CM} cm om te zoeken")
             sighting = self._look_for_pad(end_xy, cfg.HELIPAD_CLIMB_CMS)
         if sighting is None:
-            print("ℹ️  Geen H gevonden bij het eindpunt: landen op de coördinaten")
+            if not self.pose.measured or not self.pose.position_valid:
+                print("⚠️  H buiten beeld en positie onbekend: niet gestegen of blind teruggevlogen. "
+                      "De onthouden H-coördinaten zijn bewaard, maar niet bereikbaar zonder lokalisatie.")
+            else:
+                print("⚠️  Geen H in beeld: landing op H niet bevestigd")
             return False
-        t_seen, tx, ty, _ = sighting
+        t_seen, tx, ty, size = sighting
         print(f"🛬 H gevonden op ({tx:.0f}, {ty:.0f}): erboven centreren en dalen")
         period = 1.0 / cfg.RC_HZ
         deadline = time.time() + cfg.HELIPAD_TIMEOUT_S
-        good_since = None  # since when the drone stays within LAND_TOL of the middle
-        ix = iy = 0.0     # summed error: the steady push that holds the drone against drift
-        last_err = None   # error at the last fresh measurement
+        centred_since = None
+        descent_since = None
+        centred_samples = descent_samples = 0
+        last_observation = None
+        initial_error = None
+        control_started = time.time()
+        motion = MotionEstimate()
+        recovery = PadRecovery()
+        recovering = False
         try:
             while time.time() < deadline:
                 f._check_abort()
-                new = self._pad_near(end_xy, t_seen + 1e-6)
+                live = self._live_pad
+                if live is not None:
+                    t_seen, ex, ey, size, _ = live
+                else:
+                    ex = ey = 0.0
                 x, y, z, _ = self.pose.get()
-                if new:   # fresh measurement of the H (smoothed a little)
-                    t_seen = new[0]
-                    tx, ty = 0.4 * tx + 0.6 * new[1], 0.4 * ty + 0.6 * new[2]
-                    last_err = math.hypot(tx - x, ty - y)
-                    if last_err >= cfg.HELIPAD_LAND_TOL_CM:
-                        good_since = None
-                    elif good_since is None:
-                        good_since = time.time()
-                self._pad_target = (tx, ty)
-                ex, ey = tx - x, ty - y
                 err = math.hypot(ex, ey)
                 lost = time.time() - t_seen
-                if lost > 3.0 and not self.pose.measured:
-                    print("⚠️  H en odometrie kwijt: hier landen")
-                    return True
-                # low enough and steadily above the middle of the H: land
-                # (for a while: not just passing through the middle)
-                low = z <= cfg.HELIPAD_FINAL_CM + 3   # (the ToF height wobbles a bit)
-                if (low and good_since is not None and lost < 0.5
-                        and time.time() - good_since >= cfg.HELIPAD_LAND_STABLE_S):
-                    print(f"🎯 Boven het midden van de H ({last_err:.0f} cm ernaast, {z:.0f} cm hoog)")
+                if live is None or lost > cfg.HELIPAD_CONTROL_MAX_AGE_S:
+                    # Stale pixel offsets must never keep pushing the drone.
+                    f.rc(0, 0, 0, 0)
+                    centred_since = None
+                    descent_since = None
+                    centred_samples = descent_samples = 0
+                    recovering = True
+                    if lost > 3.0:
+                        print("⚠️  H uit beeld: landing onderbroken")
+                        return False
+                    snapshot = self.pose.snapshot()
+                    level = (not hasattr(self, "odometry") or self.odometry.level())
+                    camera_on = getattr(self, "downvision_enabled", True)
+                    if level and camera_on:
+                        vx, vy, _ = recovery.velocity(snapshot, time.time())
+                        if vx or vy:
+                            f.send_velocity(vx, vy, 0.0, min_units=0)
+                    else:
+                        recovery.target = None
+                    time.sleep(period)
+                    continue
+                if recovering:
+                    motion = MotionEstimate()
+                    recovering = False
+                snapshot = self.pose.snapshot()
+                # Odometry xy is already delayed with the camera. Use the pose
+                # stamped at detection, rather than applying video delay twice.
+                snapshot["pose"] = self.pose.get(t_seen)
+                recovery.observe(snapshot, (ex, ey), t_seen, time.time())
+                # Require both low speed and precise centering before handoff.
+                centred = err < cfg.HELIPAD_CENTER_TOL_CM * (2 if z > 60 else 1)
+                vx_measured, vy_measured, _ = motion.observe((-ex, -ey, 0), t_seen)
+                slow = math.hypot(vx_measured, vy_measured) <= cfg.HELIPAD_FINAL_SPEED_CMS
+                final_centred = err < cfg.HELIPAD_FINAL_TOL_CM
+                initial_error = err if initial_error is None else initial_error
+                if time.time() - control_started > 0.5 and err > initial_error + 6:
+                    print("⚠️  H-correctie gaat verder van het doel: gestopt; controleer camerakalibratie")
+                    return False
+                if t_seen != last_observation:
+                    last_observation = t_seen
+                    if final_centred and slow:
+                        centred_since = t_seen if centred_since is None else centred_since
+                        centred_samples += 1
+                    else:
+                        centred_since, centred_samples = None, 0
+                    if centred and slow:
+                        descent_since = t_seen if descent_since is None else descent_since
+                        descent_samples += 1
+                    else:
+                        descent_since, descent_samples = None, 0
+                stable = (centred_since is not None and centred_samples >= cfg.HELIPAD_MIN_SIGHTINGS
+                          and t_seen - centred_since >= cfg.HELIPAD_CENTER_STABLE_S)
+                descent_stable = (descent_since is not None and descent_samples >= cfg.HELIPAD_MIN_SIGHTINGS
+                                  and t_seen - descent_since >= cfg.HELIPAD_CENTER_STABLE_S)
+                # Image size alone cannot establish a safe final height: pads
+                # have different sizes. Keep visual control until low and settled.
+                current_height = self.read_height(default=z)
+                if stable and current_height <= cfg.HELIPAD_FINAL_CM + 4 and z <= cfg.HELIPAD_FINAL_CM + 8:
+                    print(f"🎯 Boven het midden van de H ({err:.0f} cm ernaast)")
                     return True
                 # only come down while centred and the H is in view; otherwise
                 # hold the height and steer back above it
-                centred = err < cfg.HELIPAD_CENTER_TOL_CM * (2 if z > 60 else 1)
-                vz = -cfg.HELIPAD_DESCENT_CMS if centred and lost < 1.0 and not low else 0.0
-                if lost > 1.5 and z < 120:
-                    vz = cfg.HELIPAD_DESCENT_CMS   # H out of view: go up a bit to find it again
-                gain = cfg.RC_GAIN if z > 60 else cfg.RC_GAIN * 0.7   # calmer close to the H
-                if err > 2 * cfg.HELIPAD_CENTER_TOL_CM:
-                    ix = iy = 0.0   # still on the way: only hold-against-drift counts
-                elif lost < 0.5:
-                    lim = cfg.HELIPAD_I_MAX_CMS / cfg.HELIPAD_KI
-                    ix = max(-lim, min(lim, ix + ex * period))
-                    iy = max(-lim, min(lim, iy + ey * period))
-                vx, vy = gain * ex + cfg.HELIPAD_KI * ix, gain * ey + cfg.HELIPAD_KI * iy
+                # Camera-time height lags descent. Slow using the latest ToF
+                # before the handoff, rather than overshooting until the H is
+                # cropped out of the image and cannot be recognized anymore.
+                remaining_height = current_height - cfg.HELIPAD_FINAL_CM
+                vz = (-min(cfg.HELIPAD_DESCENT_CMS, remaining_height)
+                      if descent_stable and remaining_height > 2 else 0.0)
+                vx, vy = (cfg.RC_GAIN * ex - cfg.HELIPAD_DAMPING * vx_measured,
+                          cfg.RC_GAIN * ey - cfg.HELIPAD_DAMPING * vy_measured)
                 n = math.hypot(vx, vy)
-                vmax = 15 if z > 60 else 10
-                if n > vmax:
-                    vx, vy = vx * vmax / n, vy * vmax / n
+                if n > 15:
+                    vx, vy = vx * 15 / n, vy * 15 / n
                 if not self.pose.measured and lost > 0.5:
                     # no odometry and no fresh view of the H: the position doesn't
                     # update, steering on it would fly the drone away. Hold still.
                     vx = vy = 0.0
-                # small corrections need the minimum rc value, or the Tello ignores them
-                push = err > cfg.HELIPAD_LAND_TOL_CM and (vx or vy)
-                f.send_velocity(vx, vy, vz, min_units=cfg.RC_MIN_UNITS if push and vz == 0 else 0)
+                f.send_velocity(vx, vy, vz, min_units=0 if centred else cfg.RC_MIN_UNITS)
                 time.sleep(period)
-            print(f"ℹ️  H: na {cfg.HELIPAD_TIMEOUT_S}s nog niet gecentreerd, hier landen")
-            return True
+            print(f"⚠️  H: na {cfg.HELIPAD_TIMEOUT_S}s niet gecentreerd: landing onderbroken")
+            return False
         finally:
-            self._pad_target = None
             self.follower.rc(0, 0, 0, 0)
 
     def read_height(self, default):
@@ -786,10 +1415,12 @@ class DroneApp:
     # ---------------------------------------------------------- camera thread
     def detect_loop(self):
         period = 1.0 / cfg.DETECT_HZ
+        previous = None
         while self.running:
             t_start = time.time()
             frame = self.frame_reader.frame
-            if frame is not None:
+            if frame is not None and frame is not previous:
+                previous = frame
                 try:
                     self.process_frame(frame, t_start)
                 except Exception as e:   # never let the camera view freeze
@@ -809,6 +1440,7 @@ class DroneApp:
         self.state = "idle"
 
     def toggle_recording(self):
+        self.require_vision("Opnemen")
         self.recording = not self.recording
         print(f"🎥 Opnemen {'AAN -> ' + self.record_dir if self.recording else 'UIT'}")
 
@@ -832,6 +1464,10 @@ class DroneApp:
 
     def process_frame(self, frame, t_frame):
         pose = self.pose.get(t_frame - cfg.FRAME_LATENCY_S)
+        # Visual xy is already camera-delayed when the odometry stamps it.
+        # Height/yaw use sensor history; delaying xy again shifts a fixed H.
+        image_xy = self.pose.get(t_frame)[:2]
+        pose = (*image_xy, *pose[2:])
         gray = self.cam.prepare(frame)
         if self.recording:
             self.record_frame(gray)
@@ -839,59 +1475,70 @@ class DroneApp:
         # (it is drawn green in the GUI camera view)
         # (only on the downward camera: an H on a wall is no landing pad)
         height = self.read_height(default=None)   # ToF, also when held in the hand
-        pad = (self.pad_detector.find(gray, height)
-               if cfg.HELIPAD_LAND and self.downvision_enabled else None)
+        if self.airborne and pose[2] >= 15:
+            height = pose[2]  # same capture-time scale for detection and geometry
+        level = not hasattr(self, "odometry") or (self.odometry.level() and not self.odometry._flip_active)
         h, w = gray.shape
         line = None
-        if cfg.PATH_DETECT and self.downvision_enabled:
-            line = self.path_detector.find(gray, height or (pose[2] if self.airborne else None))
-            if line is not None and pad is not None and line.contains(pad.cx, pad.cy):
-                pad = None    # an 'H' in the tape of the path is no landing pad
-        target = self._pad_target    # once: the landing thread can clear it meanwhile
-        if pad is not None:
-            self._pad_ref = (t_frame, pad, pad.size_px * cm_per_pixel(w, height) if height else None)
-        elif (target is not None and self._pad_ref is not None and height
-                and height < 70 and t_frame - self._pad_ref[0] < 10):
-            # landing, close above the H: it no longer fits in the image, so follow
-            # the middle of its cross bar ("-") instead
-            _, ref, size_cm = self._pad_ref
-            size_px = size_cm / cm_per_pixel(w, height) if size_cm else None
-            bar = self.pad_detector.find_center(gray, ref.bar_dir, ref.dark, size_px=size_px)
-            if bar is not None:
-                x, y, _ = pixel_to_world(bar.cx, bar.cy, w, h, height, pose)
-                tx, ty = target
-                if math.hypot(x - tx, y - ty) < cfg.HELIPAD_BAR_JUMP_CM:
-                    pad = bar
-        if pad is not None and self.airborne:
-            height = height or pose[2]
-            if height >= 10:
+        path_detector = getattr(self, "path_detector", None)
+        puddles = getattr(self, "puddle_detector", None)
+        if cfg.PATH_DETECT and self.downvision_enabled and path_detector is not None:
+            line = path_detector.find(gray, height or (pose[2] if self.airborne else None))
+        if cfg.HELIPAD_LAND and self.downvision_enabled and level:
+            candidates = self.pad_detector.find_candidates(gray, height)
+            if line is not None:   # an 'H' in the tape of the path is no landing pad
+                candidates = [c for c in candidates if not line.contains(c.cx, c.cy)]
+            pad = self.pad_tracker.update(candidates, t_frame, gray.shape, height_cm=height)
+        else:
+            self.pad_tracker.reset()
+            self._live_pad = None
+            pad = None
+        fresh = pad is not None and self.pad_tracker.last_seen == t_frame
+        if fresh and self.airborne:
+            self.ever_seen_h = True
+            # Use capture-time height, not current ToF during a climb/descent.
+            height = pose[2] if pose[2] >= 15 else height
+            if height is not None and height >= 15:
                 x, y, _ = pixel_to_world(pad.cx, pad.cy, w, h, height, pose)
-                if not self.pads or t_frame - self.pads[-1][0] > 5:
-                    print(f"🛬 H gezien op ({x:.0f}, {y:.0f})")
-                size = pad.size_px / w if pad.size_px else 1.0   # cross bar only: H > image
-                self.pads.append((t_frame, x, y, size))
-                del self.pads[:-200]
-        if self.airborne and self.downvision_enabled and height:
+                dx, dy, _ = pixel_to_world(pad.cx, pad.cy, w, h, height,
+                                          (0, 0, pose[2], pose[3]))
+                self._live_pad = (t_frame, dx, dy, pad.size_px / w, height)
+                # Relative centering is always possible; global pad coordinates
+                # must not be memorized from an unknown flight position.
+                if self.pose.measured and (self.pose.position_valid or self.pose.local_reference_valid):
+                    local = not self.pose.position_valid
+                    history = self.local_pads if local else self.pads
+                    if not history or t_frame - history[-1][0] > 5:
+                        print(f"🛬 H gezien op ({x:.0f}, {y:.0f})")
+                    history.append((t_frame, x, y, pad.size_px / w))
+                    del history[:-200]
+                    self.seen_helipad(local=local)
+                    if local:
+                        self._try_h_relocalization(t_frame, x, y)
+        # Map coordinates (ground map, path trail, puddles) only from a measured,
+        # level pose in the mission frame; otherwise they would be invented.
+        located = self.airborne and level and self.pose.measured and self.pose.position_valid
+        if located and self.downvision_enabled and height:
             self.ground_sample = (t_frame, self.frame_id, gray, height, pose)
         if line is not None:
-            hh = height or pose[2]
-            near, d, ends = to_body(line, w, h, hh)
-            self.path_obs = (t_frame, near, d, ends, line.touches_border)
-            if self.airborne:
+            near, d, ends = to_body(line, w, h, height or pose[2])
+            self.path_obs = (t_frame, near, d, ends, line.touches_border)   # drone frame
+            if located:
                 x, y, _, yaw = pose
                 a = math.radians(yaw)
                 wx = x + near[0] * math.cos(a) - near[1] * math.sin(a)
                 wy = y + near[0] * math.sin(a) + near[1] * math.cos(a)
-                seen = self.path_seen
+                seen = self.path_seen = getattr(self, "path_seen", [])
                 if not seen or math.hypot(seen[-1][1] - wx, seen[-1][2] - wy) > 4:
                     seen.append((t_frame, wx, wy))
                     del seen[:-5000]
-        # puddle model (own thread, also on the ground so you can test it by hand;
-        # coordinates only in the air), only on the downward camera
-        if self.downvision_enabled:
-            self.puddle_detector.submit(gray, t_frame, height or pose[2], pose, self.airborne)
-        vis = draw_helipad(cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR), pad)
-        draw_puddles(vis, self.puddle_detector.latest_boxes(gray.shape))
+        # puddle model (own thread; boxes also on the ground so it can be tested by
+        # hand, coordinates only when located), only on the downward camera
+        if self.downvision_enabled and puddles is not None:
+            puddles.submit(gray, t_frame, height or pose[2], pose, located)
+        vis = draw_helipad(cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR), pad, stale=not fresh)
+        if puddles is not None:
+            draw_puddles(vis, puddles.latest_boxes(gray.shape))
         draw_path(vis, line)
         with self._vis_lock:
             self._frame = frame.copy() if hasattr(frame, "copy") else frame
@@ -908,9 +1555,73 @@ class DroneApp:
         # thread talks to the Tello at a time.
         self.mission_thread.join(timeout=cfg.RESPONSE_TIMEOUT)
         self.safe_land()
-        try:
-            self.tello.streamoff()
-        except Exception:
-            pass
+        self.save_telemetry()
+        if hasattr(self, "odometry"):
+            self.odometry.stop()
+        if getattr(self, "video_available", True):
+            try:
+                self.tello.streamoff()
+            except Exception:
+                pass
         self.link.close()
         print("Drone landed and disconnected")
+
+    def save_hold_trace(self, label):
+        """Keep the last precise-positioning run (target, measured xyz and the commanded
+        velocity per control step) as JSON for flight analysis. Never raises."""
+        result = getattr(getattr(self, "follower", None), "last_hold_result", None)
+        if not isinstance(result, dict):
+            return None
+        try:
+            folder = os.path.join(cfg.TELEMETRY_LOG_DIR, "holds")
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, time.strftime(f"%Y%m%d_%H%M%S_{label}.json"))
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(dict(result, label=label, saved_at=time.time(),
+                               columns=["t_s", "x", "y", "z", "vx_cmd", "vy_cmd", "vz_cmd"]),
+                          stream, indent=1, default=str)
+            return path
+        except Exception as e:
+            print(f"⚠️  Positioneerlog niet bewaard: {e}")
+            return None
+
+    def save_idle_trace(self):
+        """Idle-hold steps of the flight (t, x, y, vx_cmd, vy_cmd) as JSON. Never raises."""
+        hold = getattr(self, "idle_hold", None)
+        if hold is None or not hold.trace:
+            return None
+        try:
+            folder = os.path.join(cfg.TELEMETRY_LOG_DIR, "holds")
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, time.strftime("%Y%m%d_%H%M%S_idle_hold.json"))
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump({"columns": ["t", "x", "y", "vx_cmd", "vy_cmd"], "trace": hold.trace,
+                           "disabled_reason": hold.disabled_reason}, stream)
+            hold.trace = []
+            return path
+        except Exception as e:
+            print(f"⚠️  Vasthoudlog niet bewaard: {e}")
+            return None
+
+    def save_telemetry(self):
+        """Write the whole session's telemetry to one CSV (overwritten with the full
+        history after every landing). Never raises: a log must not affect flying."""
+        telemetry = getattr(self, "telemetry", None)
+        if telemetry is None:
+            return None
+        try:
+            if getattr(self, "_telemetry_log", None) is None:
+                self._telemetry_log = os.path.join(
+                    cfg.TELEMETRY_LOG_DIR, time.strftime("telemetry_%Y%m%d_%H%M%S.csv"))
+            os.makedirs(os.path.dirname(self._telemetry_log) or ".", exist_ok=True)
+            rows = telemetry.export_csv(self._telemetry_log)
+            print(f"📝 Telemetrie bewaard: {self._telemetry_log} ({rows} metingen)")
+            return self._telemetry_log
+        except Exception as e:
+            print(f"⚠️  Telemetrie niet bewaard: {e}")
+            return None
+
+    def require_vision(self, action):
+        if not getattr(self, "vision_navigation_available", True):
+            raise CommandRejected(f"{action} indisponible : caméra inférieure non confirmée en STA. "
+                                  "Revenir en AP pour la navigation visuelle.")

@@ -17,9 +17,15 @@ The Jetson converts real-world coordinates to this frame before sending them.
 # ---------------------------------------------------------------------------
 # Network link with the Jetson (JSON over UDP, one message per datagram)
 # ---------------------------------------------------------------------------
+TELLO_AP_HOST = "192.168.10.1"
+TELLO_CONNECTION_MODE = "ap"  # default remains the direct drone Wi-Fi
+TELLO_STA_HOST = ""           # optional LAN IPv4; never put Wi-Fi credentials here
+WIFI_REBOOT_WAIT_S = 12       # SDK says reboot after 3s; allow time for association/DHCP
+STA_VIDEO_PROBE_TIMEOUT_S = 4 # require decoded frames, not just a streamon acknowledgement
 LISTEN_HOST = "127.0.0.1"   # loopback by default; set to 0.0.0.0 only if required
 LISTEN_PORT = 9000          # Jetson sends commands to this port
-JETSON_HOST = None          # None = reply to whoever sent the last command;
+JETSON_HOST = None          # None = only local scripts (127.0.0.1) may send commands,
+                            # replies go to the last sender;
                             # an IP = only accept commands from that address
 JETSON_PORT = 9001          # Jetson listens on this port for status/events
 STATUS_INTERVAL = 1.0       # seconds between status messages
@@ -32,8 +38,43 @@ MAX_STEP_CM = 100           # long segments are split in steps of max this lengt
                             # (smaller = more corrections + faster abort)
 MIN_MOVE_CM = 20            # Tello cannot 'go' when |x|,|y|,|z| are all < 20
 MIN_BATTERY = 5             # refuse a mission below this battery %
+FLIP_MIN_BATTERY = 20       # application threshold; Ryze specifies >=50% for intelligent modes
+FLIP_RETURN_RC_SPEED = 25   # cap approach speed to avoid repeated overshoot with SDK/video delay
+FLIP_RETURN_GAIN = 1.2
+FLIP_RETURN_DAMPING = 0.4  # moderate velocity feedback avoids delayed opposite corrections
+FLIP_RETURN_Z_SPEED = 8    # cm/s, keep altitude corrections slower than horizontal recovery
+FLIP_RETURN_TOL_CM = 3     # measured xy radius tolerance, not absolute accuracy
+FLIP_RETURN_Z_TOL_CM = 8   # altitude tolerance (ToF). Flight log 2026-10-22: xy returned to
+                           # 2.2 cm, but z stayed 6.5 cm high while rc ud=-8 had no effect
+                           # (vertical stick dead zone), so a 3 cm z band could never confirm
+FLIP_RETURN_TIMEOUT_S = 8
+FLIP_RETURN_SETTLE_S = 0.4 # remain within tolerance before reporting a confirmed return
+FLIP_RECORD_PATH = "flight_logs/last_flip.json"  # written after recovery, never before SDK send
+FLIP_TRACK_TIMEOUT_S = 5   # maximum search; a confirmed match starts the return immediately
+FLIP_ACK_TIMEOUT_S = 5     # one SDK request; do not retry an acrobatic manoeuvre
 RESPONSE_TIMEOUT = 20       # s, djitellopy wait time for 'ok' (long go commands)
+CONNECT_TIMEOUT = 3         # s per SDK handshake attempt; independent of long moves
+CONNECT_ATTEMPTS = 2
+CONNECT_STATE_TIMEOUT = 2   # s to receive telemetry after the SDK acknowledgement
 KEEPALIVE_INTERVAL = 5      # s, Tello lands by itself after 15 s without commands
+
+# Hold the spot while hovering between commands (navigator.IdleHold), with the
+# visual odometry. Without it the real drone drifted 40-60 cm in 20 s.
+IDLE_HOLD = True
+IDLE_HOLD_GAIN = 0.8        # 1/s, cm/s towards the spot per cm of error
+IDLE_HOLD_DAMPING = 0.4     # brakes the measured velocity (no overshoot)
+IDLE_HOLD_MAX_CMS = 15      # never faster than this
+IDLE_HOLD_DEADBAND_CM = 3   # closer than this: only brake, don't push
+IDLE_HOLD_MAX_ERR_CM = 40   # further from the spot: switch the hold off for this flight
+IDLE_HOLD_I_GAIN = 0.5      # 1/s^2, extra push per cm of error that lasts (steady drift, wind)
+IDLE_HOLD_I_MAX_CMS = 10    # ... up to this speed
+IDLE_HOLD_I_ZONE_CM = 12    # ... only this close to the spot (further away: plain approach)
+IDLE_HOLD_GROWTH_CM = 15    # error this much above its smallest value of the correction ...
+IDLE_HOLD_GROWTH_S = 2.5    # ... for this long: wrong axes -> switch off for this flight
+IDLE_HOLD_SIGN_S = 1.5      # compare commands and measured movement over this time
+IDLE_HOLD_SIGN_MIN_CMS = 10  # ... only while steering at least this fast on average
+                            # (a gust can beat a small correction, not a firm one)
+IDLE_HOLD_SIGN_BACK_CMS = 4  # moving this fast AGAINST the command: wrong axes -> switch off
 LAND_AT_END = True          # land after the last waypoint (mission can override)
 
 # Navigation mode (the GUI can change it per mission)
@@ -52,9 +93,6 @@ FINE_TIMEOUT_S = 4          # give up precise positioning after this time
 
 # The Tello slides sideways while it takes off and lands. With working odometry:
 TAKEOFF_RECENTER = True     # after takeoff, move back above the takeoff spot
-TAKEOFF_RECENTER_TOL_CM = 4  # ... until closer than this (FINE_TOL_CM is much looser)
-TAKEOFF_RECENTER_TIMEOUT_S = 8  # ... but give up after this time
-TAKEOFF_RECENTER_SETTLE_S = 0.5  # ... and stay that close this long (no coasting past it)
 RESET_FRAME_ON_TAKEOFF = True  # new mission frame at every takeoff (see the top of this file)
 PRECISE_LAND = True         # mission end: descend slowly while holding the spot, then land
 LAND_HOVER_CM = 30          # ... down to this height, the last bit is the normal 'land'
@@ -65,21 +103,23 @@ HELIPAD_LAND = True         # mission end: look for an H near the last waypoint 
 HELIPAD_RADIUS_CM = 80      # only an H within this distance of the last waypoint counts
                             # (an H seen anywhere during the mission is always used)
 HELIPAD_MIN_SIGHTINGS = 3   # an H must be seen this often at one place to fly back to it
+HELIPAD_TRACK_HOLD_S = 0.35 # keep the overlay through brief missed detections
+HELIPAD_CONTROL_MAX_AGE_S = 0.25  # never descend using an older camera offset
+HELIPAD_CENTER_STABLE_S = 0.3     # centre must remain consistent before descending
+HELIPAD_DAMPING = 0.8
+HELIPAD_APPROACH_MAX_S = 15       # bounded remembered-position approach, adapted to distance
+HELIPAD_RELOCALIZE_MAX_CM = 60    # known-pad relocalization only near its predicted position
+HELIPAD_RELOCALIZE_SPREAD_CM = 5  # independent observations must agree on the frame correction
                             # (the camera sees about +-45 cm around the drone at 80 cm, +-85 at 150)
 HELIPAD_SEARCH_S = 2.0      # hover this long at the end point looking for the H
 HELIPAD_SEARCH_HEIGHT_CM = 150  # not found: climb to this height (sees more floor) and look again
 HELIPAD_CLIMB_CMS = 30      # climb speed for that
 HELIPAD_CENTER_TOL_CM = 6   # only descend while the H is this close below the drone centre
-HELIPAD_LAND_TOL_CM = 2.5   # final: the middle of the H must be this close below the drone ...
-HELIPAD_LAND_STABLE_S = 0.5  # ... for this long (s) before 'land'
-HELIPAD_FINAL_CM = 25       # centred at this height -> normal 'land' for the last bit
-                            # (below ~45 cm the H doesn't fit in the image any more: the
-                            # middle of its cross bar "-" is followed instead)
-HELIPAD_BAR_JUMP_CM = 12    # a cross bar seen further than this from the H is ignored
+HELIPAD_FINAL_CM = 50       # stop descent here to settle before the H is clipped by the camera
+HELIPAD_FINAL_TOL_CM = 3    # tighter centering before the final SDK landing
+HELIPAD_FINAL_SPEED_CMS = 4 # do not hand off to SDK land during a fast pass over the pad
 HELIPAD_DESCENT_CMS = 20    # descent speed above the H
-HELIPAD_KI = 0.6            # 1/s, extra push per cm of error that lasts (wind, drift)
-HELIPAD_I_MAX_CMS = 8       # ... up to this speed
-HELIPAD_TIMEOUT_S = 40      # give up (normal landing) after this time
+HELIPAD_TIMEOUT_S = 25      # stop centering and hover if the H cannot be reached in time
 HELIPAD_MIN_AREA_PX = 60    # smallest H blob (pixels) that counts (about 10 x 10 px)
 HELIPAD_SIZE_RANGE_CM = (8, 60)  # an H is between these sizes (only checked with a height)
 HELIPAD_ADAPTIVE = True     # also threshold against the local brightness (H seen from higher up)
@@ -101,8 +141,6 @@ PATH_TOL_CM = 15            # rc mode: up to this far beside the path is fine, t
                             # flies parallel to it; only the part beyond this is corrected
 RC_PASS_CM = 12             # waypoint counts as passed within this distance
 RC_GAIN = 1.2               # 1/s, speed towards the path per cm of error
-HOLD_I_GAIN = 0.6           # 1/s², precise positioning: extra push against a steady drift
-HOLD_I_MAX_CMS = 10         # ... up to this speed (cm/s)
 RC_YAW_GAIN = 1.5           # rc yaw units per degree heading error
 RC_HZ = 15                  # control loop rate
 RC_MIN_UNITS = 8            # smallest rc value that still moves the drone
@@ -121,8 +159,11 @@ GEOFENCE = {
 # ---------------------------------------------------------------------------
 FRAME_IS_RGB = True         # djitellopy >= 2.4 delivers RGB frames
 DOWNCAM_CROP = None         # (x, y, w, h) of the useful image area, or None
-AUTO_CROP = True            # auto-detect black borders around the bottom image
-CAM_HFOV_DEG = 60.0         # horizontal field of view of the bottom camera
+AUTO_CROP = False           # keep optical centre fixed; dark scene regions are not video padding
+CAM_HFOV_DEG = 70.0         # horizontal field of view of the bottom camera.
+                            # Measured 2026-11-12 on our drone (ground_check.py snap, A4 sheet,
+                            # ToF heights 61/80/101 cm): 70.6/69.6/69.4 deg. 60 gave distances
+                            # ~17% too short; 70 is within +-1% at 60-100 cm (with the ToF height)
 CAM_FORWARD_SIGN = 1        # 1: top of image = drone forward, -1: flipped
 CAM_LEFT_SIGN = 1           # 1: left of image = drone left,   -1: flipped
 CAM_ROTATE_DEG = 270          # camera image turned 0/90/180/270 deg relative to the drone.
@@ -145,9 +186,9 @@ VO_MAX_YAW_STEP = 1.5       # deg turned since the keyframe; more = take a new k
 VO_KEY_SHIFT_PX = 20        # new keyframe after this much image shift
 VO_KEY_QUALITY = 0.3        # ... or when the match quality drops below this
 VO_LOST_S = 0.7             # s without good frames = odometry lost
-VO_ZOOM_MIN = 0.01          # height changed more than this part since the reference frame:
-                            # scale the reference first (climbing looks like a zoom, not a shift)
-VO_MAX_ZOOM = 0.12          # frames up to this height difference (part) are still compared
+VO_MAX_TILT_DEG = 12        # translation-only floor tracking needs a near-level camera
+VO_MIN_CORRELATION = 0.5    # reject unrelated/blurred floor frames
+VO_MAX_SPEED_CMS = 150      # reject impossible visual jumps
 
 # ---------------------------------------------------------------------------
 # Telemetry (sensor graphs in the GUI) and terrain analysis
@@ -171,6 +212,10 @@ TERRAIN_PROFILE_MAX = 6000  # samples kept for the height profile along the trac
 RECORD_DIR = "dataset"      # default folder when recording is toggled on
 RECORD_HZ = 2               # images per second (don't make near-identical images)
 RECORD_ONLY_AIRBORNE = False  # True: only save while flying
+
+# Telemetry of every session (pose estimate, odometry state, sensors) is written
+# to this folder after each landing and at shutdown, for flight analysis.
+TELEMETRY_LOG_DIR = "flight_logs"
 
 # ---------------------------------------------------------------------------
 # Puddle detection with a trained model (YOLO from Ultralytics, e.g. trained on
