@@ -103,19 +103,32 @@ juiste plek.
 tello_gui.py          ← start hier: grafische besturing (pad plannen, grondkaart, 3D, terrein, sensoren, camera)
 tello_combined.py     ← live vliegen met het toetsenbord (ZQSD), handig om te testen/kalibreren
 drone/
-    app.py            kern: missies afvliegen, pad volgen, plassen fotograferen, landen op een H, Jetson-koppeling
+    app.py            kern: missies afvliegen, pad volgen, plassen fotograferen, landen op een H, salto, Jetson-koppeling
+    connection.py     verbinden met de drone (AP of STA), met duidelijke foutmeldingen
+    network.py        AP/STA-instellingen en de Wi-Fi-wizard (zie docs/wifi-ap-sta.md)
+    video.py          videostream: in STA alleen "aan" als er echt beelden binnenkomen
     config.py         alle instellingen (netwerk, snelheid, geofence, camera, landen, plassen, pad)
     navigator.py      positie + waypoints afvliegen (stap- of vloeiende modus)
     odometry.py       meet de echte beweging: camera (visuele odometrie), kompas, hoogte
     downcam.py        onderste camera: grijs + bijsnijden, pixel → coördinaat
-    helipad.py        H-landingsplatform herkennen (zonder training)
+    helipad.py        H-landingsplatform herkennen (zonder training) en volgen tussen beelden
+    pad_recovery.py   H even kwijt tijdens het landen: terugsturen naar de laatste plek
+    registration.py   vloerbeeld na een salto terugvinden in het beeld van ervoor (terugkeren)
+    camera_calibration.py  camerarichting afleiden uit met de hand verschoven beelden (motoren uit)
     pathline.py       strook (tape/papier) op de vloer herkennen
     puddles.py        plassen herkennen met een getraind YOLO-model + samenvoegen
     jetson_link.py    UDP/JSON-communicatie met de Jetson
     telemetry.py      alle sensorwaarden over tijd + terreinkaart (barometer − ToF)
     sim.py            simulator: alles testen zonder drone (`--sim`), met dozen, tape en plassen op de vloer
     keypress.py       toetsenbord-hulp voor tello_combined.py
-gui/                  onderdelen van de GUI: thema, instrumenten, grondkaart, padweergave, 3D-weergave, kaart
+gui/                  onderdelen van de GUI: thema, instrumenten, grondkaart, padweergave, 3D-weergave, kaart,
+                      verbindingsvenster (AP/STA) en wat de salto-knop en de positieweergave mogen tonen
+tests/                unit tests (python -m unittest tests.test_...) en een volledige simulatorvlucht
+                      (python -X utf8 -m tests.sim_scenario)
+ground_check.py       controles met de motoren uit: telemetrie, camera's, ToF, H-herkenning
+calibrate_camera.py   camerarichting meten zonder te vliegen (drone met de hand verschuiven)
+fake_jetson.py        nep-Jetson om de UDP-koppeling te testen (zie docs/jetson-koppeling.md)
+lancer_gui.bat        Windows: start de GUI met de Python van .venv
 json_flights/         opgeslagen vluchten (JSON), te openen met Opslaan/Laden in de GUI
 sim_scenes/           zelfgemaakte vloeren voor de simulator (pad, plassen, H, dozen)
 models/               hier komt het getrainde plasmodel (puddles.pt), niet in git
@@ -661,8 +674,9 @@ gevonden, op 1 tot 4 cm van hun echte plek, elk met een foto.
 
 1. **Beeld controleren.** Start `tello_combined.py` (de onderste camera staat meteen aan, V schakelt)
    en maak een foto (F).
-   Kijk of het onderste camerabeeld in zwarte randen zit. `AUTO_CROP` vangt dat normaal op;
-   anders zet je `DOWNCAM_CROP = (x, y, w, h)`.
+   Kijk of het onderste camerabeeld in zwarte randen zit. Zo ja, zet `DOWNCAM_CROP = (x, y, w, h)`
+   (`AUTO_CROP` staat uit: donkere stukken vloer werden soms als rand weggesneden, waardoor het
+   midden van het beeld verschoof).
 2. **Beeldhoek (`CAM_HFOV_DEG`).** Houd de drone op een bekende hoogte `h` (cm) boven een
    meetlat en lees af hoeveel cm `W` er horizontaal in beeld past:
    `CAM_HFOV_DEG = 2 * atan((W / 2) / h)` (in graden).
