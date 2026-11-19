@@ -187,10 +187,12 @@ De drone kan op twee manieren vliegen:
   daar (of op een H die hij onderweg zag). Een plas onderweg onderbreekt het volgen voor de
   foto, daarna zoekt hij de strook weer op.
 
-De herkenning (`drone/pathline.py`) zoekt in het beeld van de onderste camera de grootste
-lange, smalle vorm die duidelijk donkerder (`PATH_DARK = True`) of lichter is dan de vloer,
-`PATH_WIDTH_CM` breed en minstens `PATH_MIN_LENGTH_CM` lang (zo tellen de balken van de H en
-papieren plassen niet mee). Ze draait in **elke** vlucht: ook tijdens een geplande route wordt
+De herkenning (`drone/pathline.py`) zoekt in het beeld van de onderste camera de lange, smalle
+vorm die duidelijk donkerder (`PATH_DARK = True`) of lichter is dan de vloer, `PATH_WIDTH_CM`
+breed en minstens `PATH_MIN_LENGTH_CM` lang (zo tellen kleine H's en papieren plassen niet mee).
+Zijn er meer zulke vormen in beeld, dan telt de vorm die **het dichtst onder de drone** ligt,
+niet de grootste: anders kon een dikke balk van een grote H naast de tape het "pad" worden, en
+dan stopte de drone meteen bij het einde van die balk en landde hij op de H. Ze draait in **elke** vlucht: ook tijdens een geplande route wordt
 het pad dat de drone onder zich ziet op de grondkaart getekend (oranje), en in het
 camerabeeld staat de herkende strook als oranje lijn. Pas `PATH_*` in `drone/config.py` aan
 jullie strook aan (kleur, breedte). De simulator heeft een donkere tape-strook van 5 cm, en je
