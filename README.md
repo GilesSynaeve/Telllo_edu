@@ -1,25 +1,131 @@
-# Tello EDU – autonoom pad volgen + landen op een H
+# Tello EDU – pad afvliegen, plassen vinden en doorsturen naar een Jetson
+
+Een **Tello EDU**-drone vliegt autonoom een pad af, herkent onderweg **plassen** met zijn onderste
+camera en een **getraind YOLO-model**, en stuurt de **coördinaten** van elke plas naar een
+**Jetson**. Aan het einde landt hij op een **H**-platform.
+
+* **Twee manieren om te vliegen**: een geplande route met waypoints, of een strook tape/papier op
+  de vloer volgen ([Pad op de vloer](#pad-op-de-vloer-herkennen-en-volgen)).
+* **Plassen**: het model draait op de laptop; elke plas krijgt een coördinaat in cm, een foto van
+  recht boven en één bericht naar de Jetson ([Plassen herkennen](#plassen-herkennen-getraind-model)).
+* **Positie zonder GPS**: visuele odometrie met de onderste camera, kompas en ToF-hoogte
+  ([Nauwkeurig vliegen](#nauwkeurig-vliegen)).
+* **Landen op een H** zonder training ([Landen op een H](#landen-op-een-h-helipad)).
+* **GUI** met een grondkaart van de vloer, 3D-weergave, terreinkaart en sensorgrafieken
+  ([De GUI](#de-gui)).
+* **Simulator**: alles testen zonder drone, met een eigen vloer met pad en plassen
+  ([Simulator](#testen-in-de-simulator-eigen-pad-met-plassen)).
+
+![Grondkaart na pad volgen in de simulator: drie plassen gevonden en op het pad geprojecteerd](docs/img/grondkaart-pad-volgen.png)
+
+## Inhoud
+
+* [Snel starten](#snel-starten)
+* [Installatie](#installatie)
+* [Mappen en bestanden](#mappen-en-bestanden)
+* [Opbouw](#opbouw) en [Coördinatenstelsel](#coördinatenstelsel-mission-frame)
+* [De GUI](#de-gui)
+* [Protocol met de Jetson](#protocol-json-over-udp-één-bericht-per-pakket)
+* [Pad op de vloer herkennen en volgen](#pad-op-de-vloer-herkennen-en-volgen)
+* [Hoe het werkt](#hoe-het-werkt), [Terreinanalyse](#terreinanalyse), [Nauwkeurig vliegen](#nauwkeurig-vliegen), [Landen op een H](#landen-op-een-h-helipad)
+* [Beelden opnemen](#beelden-opnemen-dataset-voor-het-model) en [Plassen herkennen](#plassen-herkennen-getraind-model)
+* [Testen in de simulator](#testen-in-de-simulator-eigen-pad-met-plassen)
+* [Kalibreren](#kalibreren-belangrijk-vóór-de-eerste-echte-vlucht), [Live vliegen met het toetsenbord](#live-vliegen-met-het-toetsenbord) en [Veiligheid](#veiligheid)
+
+Meer uitleg in [`docs/`](docs/):
+
+| document | waarover |
+|---|---|
+| [plasmodel-trainen-en-testen.md](docs/plasmodel-trainen-en-testen.md) | Tutorial: dataset opnemen, labelen in Roboflow, YOLO trainen, runs vergelijken, testen op de drone |
+| [plasdetectie-ontwerpkeuzes.md](docs/plasdetectie-ontwerpkeuzes.md) | Waarom een getraind model (en geen drempels of kant-en-klaar model), en waarom het op de laptop draait |
+| [jetson-koppeling.md](docs/jetson-koppeling.md) | Netwerk, instellingen, assenstelsel en testscripts voor de Jetson |
+
+## Snel starten
+
+```bash
+git clone https://github.com/GilesS420/Telllo_edu.git
+cd Telllo_edu
+python -m venv .venv
+.venv\Scripts\activate                 # Windows  (Linux/macOS: source .venv/bin/activate)
+pip install -r requirements.txt
+python tello_gui.py --sim --scene sim_scenes/pad_met_plassen.json
+```
+
+Druk in de GUI op **Volg pad op de vloer**: de gesimuleerde drone volgt de tape, vindt drie
+plassen, fotografeert ze en landt. Voor de echte drone: zet `models/puddles.pt` klaar (zie
+[Installatie](#installatie)), verbind de laptop met de Wi-Fi van de Tello en start
+`python tello_gui.py`. Lees eerst [Kalibreren](#kalibreren-belangrijk-vóór-de-eerste-echte-vlucht).
+
+## Installatie
+
+**Nodig**
+
+* Python **3.10 tot 3.12** (daarmee werken PyTorch en Ultralytics het vlotst). `tkinter` zit bij
+  Python op Windows; op Linux: `sudo apt install python3-tk`.
+* Een Tello EDU, en een laptop met Wi-Fi. Voor de Jetson-koppeling een tweede netwerkverbinding,
+  zie [jetson-koppeling.md](docs/jetson-koppeling.md).
+* Om te trainen: een NVIDIA-GPU of Google Colab. Om het model te *gebruiken* is een GPU niet
+  nodig.
+
+**Pakketten** (in een venv):
+
+```bash
+pip install -r requirements.txt
+```
+
+| pakket | waarvoor |
+|---|---|
+| `djitellopy` | praten met de Tello |
+| `opencv-python`, `numpy` | camerabeelden, H- en padherkenning, odometrie |
+| `matplotlib`, `pillow` | de GUI (grafieken, kaarten, camerabeeld) |
+| `ultralytics` | het plasmodel. Zonder dit pakket werkt alles, maar zonder plasdetectie |
+| `keyboard` | alleen voor `tello_combined.py` |
+
+Wil je trainen op een NVIDIA-GPU en geeft `python -c "import torch; print(torch.cuda.is_available())"`
+`False`, installeer dan PyTorch met CUDA (zie [de tutorial](docs/plasmodel-trainen-en-testen.md#1-eenmalig-de-laptop-klaarmaken)).
+
+**Het plasmodel.** Het getrainde model zit **niet** in git (`models/` staat in `.gitignore`).
+Zet het bestand op `models/puddles.pt`. Het model dat nu gebruikt wordt is de run `train-6`
+(YOLO11n, `imgsz=320`, test-mAP50 0.719, recall 0.661):
+
+```bash
+copy runs\detect\train-6\weights\best.pt models\puddles.pt     # Windows
+cp runs/detect/train-6/weights/best.pt models/puddles.pt         # Linux/macOS
+```
+
+In het infovak rechtsonder in de GUI staat daarna *Nog geen plassen gevonden (model actief)*.
+Staat er *Plasdetectie uit: geen model (models/puddles.pt)*, dan staat het bestand niet op de
+juiste plek.
+
+## Mappen en bestanden
 
 ```
 tello_gui.py          ← start hier: grafische besturing (pad plannen, grondkaart, 3D, terrein, sensoren, camera)
 tello_combined.py     ← live vliegen met het toetsenbord (ZQSD), handig om te testen/kalibreren
 drone/
-    app.py            kern: missies afvliegen, landen op een H, Jetson-koppeling
-    config.py         alle instellingen (netwerk, snelheid, geofence, camera, landen)
+    app.py            kern: missies afvliegen, pad volgen, plassen fotograferen, landen op een H, Jetson-koppeling
+    config.py         alle instellingen (netwerk, snelheid, geofence, camera, landen, plassen, pad)
     navigator.py      positie + waypoints afvliegen (stap- of vloeiende modus)
     odometry.py       meet de echte beweging: camera (visuele odometrie), kompas, hoogte
     downcam.py        onderste camera: grijs + bijsnijden, pixel → coördinaat
     helipad.py        H-landingsplatform herkennen (zonder training)
+    pathline.py       strook (tape/papier) op de vloer herkennen
     puddles.py        plassen herkennen met een getraind YOLO-model + samenvoegen
     jetson_link.py    UDP/JSON-communicatie met de Jetson
     telemetry.py      alle sensorwaarden over tijd + terreinkaart (barometer − ToF)
     sim.py            simulator: alles testen zonder drone (`--sim`), met dozen, tape en plassen op de vloer
-gui/                  onderdelen van de GUI: thema, instrumenten, grondkaart, 3D-weergave, kaart
     keypress.py       toetsenbord-hulp voor tello_combined.py
+gui/                  onderdelen van de GUI: thema, instrumenten, grondkaart, padweergave, 3D-weergave, kaart
 json_flights/         opgeslagen vluchten (JSON), te openen met Opslaan/Laden in de GUI
 sim_scenes/           zelfgemaakte vloeren voor de simulator (pad, plassen, H, dozen)
-docs/                 afbeeldingen voor deze README
+models/               hier komt het getrainde plasmodel (puddles.pt), niet in git
+vergelijk.py          hulpscript: trainingsruns in runs/detect/ vergelijken (beste mAP50)
+avg_conf.py           hulpscript: gemiddelde zekerheid van een model op de testbeelden
+docs/                 extra documentatie en afbeeldingen voor deze README
 ```
+
+Tijdens het gebruik verschijnen ook `dataset/` (opgenomen beelden), `photos/` (foto's van de
+plassen) en `runs/` (trainingen). Die staan in `.gitignore`.
 
 ## Opbouw
 
@@ -62,23 +168,18 @@ In plaats daarvan kan de Jetson ook vóór het opstijgen `{"type":"set_pose","x"
 sturen en dan rechtstreeks in zijn eigen stelsel (in cm) werken. Die positie blijft dan
 gelden voor de eerstvolgende start (in plaats van het automatisch resetten).
 
-## Installatie (in je venv)
-
-```bash
-pip install -r requirements.txt
-```
-
-## Gebruik
+## De GUI
 
 ```bash
 python tello_gui.py --sim             # eerst proberen zonder drone
 python tello_gui.py --sim --scene sim_scenes/pad_met_plassen.json   # eigen pad met plassen
+python tello_gui.py --sim --sim-model # simulator, maar met het echte plasmodel i.p.v. SimPuddleModel
 python tello_gui.py                   # echte drone (laptop op de Wi-Fi van de Tello)
 python tello_gui.py --record dataset  # meteen camerabeelden opslaan (dataset voor het model)
 python tello_combined.py              # live vliegen met het toetsenbord
 ```
 
-![Tello GUI](docs/gui.png)
+![Grondkaart na een geplande route in de simulator: gevlogen spoor, plas P1, de H (H1) en het stuk tape dat de drone zag](docs/img/grondkaart-missie.png)
 
 **Bovenbalk**: toestand, batterij, vliegtijd, hoogte, odometrie en of de Jetson berichten
 stuurt. Meldingen (H gezien, waarschuwingen, fouten) verschijnen rechtsboven in plaats
@@ -97,8 +198,13 @@ van in pop-ups.
   (zie `json_flights/mission_example.json` voor het formaat).
 * **Vliegen**: *Start missie*, *Ga naar punt* (blijft daarna hangen), *Opstijgen*,
   *Landen* (toets L), *Landen op de H* (toets H), *Reset omgeving* (alleen op de grond, zie
-  [Coördinatenstelsel](#coördinatenstelsel-mission-frame)) en **NOODSTOP** (toets X, motoren
+  [Coördinatenstelsel](#coördinatenstelsel-mission-frame)), *Volg pad op de vloer* (zie
+  [Pad op de vloer](#pad-op-de-vloer-herkennen-en-volgen)) en **NOODSTOP** (toets X, motoren
   uit, de drone valt!).
+* **Missie-instellingen**: snelheid, *Vliegmodus* (stap of vloeiend, zie
+  [Nauwkeurig vliegen](#nauwkeurig-vliegen)), *Nauwkeurig positioneren*, en de vinkjes
+  *Landen na het laatste punt*, *Zelfde hoogte houden* en *Geen H gezien: landen op het 1e punt*
+  (zie [Landen op een H](#landen-op-een-h-helipad)).
 
 **Midden: vier tabbladen** (Ctrl+1/2/3/4)
 * **Grondkaart** (hoofdbeeld): de **vloer van bovenaf**, opgebouwd uit de beelden van de
@@ -134,16 +240,23 @@ van in pop-ups.
   snelheid, houding (pitch/roll), versnelling, batterij en temperatuur. Kies het venster
   (30 s, 1 min, 5 min) en exporteer alles naar CSV voor een verslag.
 
-![Kaart en terrein](docs/gui_terrein.png)
+![3D-weergave tijdens een missie](docs/img/3d-weergave.png)
+
+![Kaart en terrein: de dozen van de simulator als obstakels, met het hoogteprofiel](docs/img/kaart-terrein.png)
 
 **Rechts**: camerabeeld (voor/onder, met of zonder de H-detectie, opnemen voor de dataset),
 de instrumenten (kunstmatige horizon, kompas met de vastgehouden richting, hoogtemeter met de
 grond eronder), de belangrijkste sensorwaarden en waar de H gezien is.
 
-![Sensoren](docs/gui_sensoren.png)
+![Sensoren tijdens pad volgen; in het camerabeeld de herkende strook (oranje) en twee plassen (blauw)](docs/img/sensoren.png)
 
 De Jetson-verbinding blijft actief terwijl de GUI open is: missies van de Jetson worden
-gewoon uitgevoerd en getekend.
+gewoon uitgevoerd en getekend. Hoe je de Jetson aansluit staat in
+[docs/jetson-koppeling.md](docs/jetson-koppeling.md).
+
+**Sneltoetsen**: Enter = waypoint toevoegen, Delete = punt wissen, Ctrl+Z = ongedaan maken,
+Ctrl+S / Ctrl+O = opslaan / laden, Ctrl+1…4 = tabblad, L = landen, H = landen op de H,
+X = noodstop.
 
 ## Protocol (JSON over UDP, één bericht per pakket)
 
@@ -158,6 +271,7 @@ gewoon uitgevoerd en getekend.
 | `helipad_land` | – | Test zonder pad: opstijgen (als nodig), een H onder de drone zoeken en erop landen |
 | `set_pose` | `x`, `y`, `yaw` (graden, links = positief) | Startpositie/-richting instellen (alleen op de grond) |
 | `reset` | – | Omgeving resetten (alleen op de grond): drone = (0, 0), x = richting van de neus, gevonden H en terreinkaart wissen |
+| `downvision` | `enabled` (true/false) | Onderste camera aan of uit (uit = voorcamera; dan staan odometrie, H-, pad- en plasdetectie uit) |
 | `ping` | `t` | Antwoord: `pong` |
 
 **Drone → Jetson** (poort 9001; naar het IP waar het laatste commando vandaan kwam, of `JETSON_HOST`)
@@ -174,6 +288,7 @@ gewoon uitgevoerd en getekend.
 | `error` | `ref`, `error` |
 
 Plassen worden herkend door een getraind model, zie [Plassen herkennen](#plassen-herkennen-getraind-model).
+Netwerk, instellingen en testscripts voor de Jetson: [docs/jetson-koppeling.md](docs/jetson-koppeling.md).
 
 ## Pad op de vloer herkennen en volgen
 
@@ -416,6 +531,20 @@ gevonden plassen krijgen een blauw kader in het camerabeeld van de GUI, met de z
 (in de lucht) hun coördinaat. Op de grondkaart, de kaart en in de 3D-weergave verschijnen ze als **P1, P2, …**
 De Jetson krijgt per plas één `puddle`-bericht met de coördinaten (zie [Protocol](#protocol-json-over-udp-één-bericht-per-pakket)).
 
+**Gebruikt model**: run `train-6`, YOLO11n bijgetraind op de eigen Roboflow-dataset
+`tello-downward-puddle-detection` (beelden van de onderste camera, grijs, van recht boven).
+
+| | |
+|---|---|
+| beeldgrootte (`imgsz`, = `PUDDLE_IMGSZ`) | 320 |
+| mAP50 op de testset | 0.719 |
+| recall op de testset | 0.661 |
+
+De volledige stappen (opnemen, labelen, trainen, runs vergelijken met `vergelijk.py`, testen op de
+drone) staan in de tutorial [docs/plasmodel-trainen-en-testen.md](docs/plasmodel-trainen-en-testen.md).
+Waarom een getraind model en geen drempels: [docs/plasdetectie-ontwerpkeuzes.md](docs/plasdetectie-ontwerpkeuzes.md).
+Kort:
+
 1. Train het model op je Roboflow-dataset (export *YOLOv11*):
    ```bash
    pip install ultralytics
@@ -509,9 +638,12 @@ start dan met `--sim-model`. Het model zelf test je op echte beelden, zie
 Resultaat met `sim_scenes/pad_met_plassen.json` (pad volgen, met wind): 3 van de 3 plassen
 gevonden, op 1 tot 4 cm van hun echte plek, elk met een foto.
 
+![Foto van een plas in de simulator: zonder en met detectie (kader, coördinaat en de herkende strook)](docs/img/plasfoto-sim.png)
+
 ## Kalibreren (belangrijk vóór de eerste echte vlucht)
 
-1. **Beeld controleren.** Start `tello_combined.py`, zet downvision aan (V) en maak een foto (F).
+1. **Beeld controleren.** Start `tello_combined.py` (de onderste camera staat meteen aan, V schakelt)
+   en maak een foto (F).
    Kijk of het onderste camerabeeld in zwarte randen zit. `AUTO_CROP` vangt dat normaal op;
    anders zet je `DOWNCAM_CROP = (x, y, w, h)`.
 2. **Beeldhoek (`CAM_HFOV_DEG`).** Houd de drone op een bekende hoogte `h` (cm) boven een
@@ -530,6 +662,24 @@ gevonden, op 1 tot 4 cm van hun echte plek, elk met een foto.
    (stap 3) niet, dan zie je in de log "odometrie UITGESCHAKELD". Klopt de afstand niet
    (bv. de positie zegt 80 cm terwijl hij 1 m vloog), dan staat `CAM_HFOV_DEG` (stap 2)
    verkeerd: de odometrie gebruikt dezelfde beeldhoek om pixels naar cm om te rekenen.
+
+## Live vliegen met het toetsenbord
+
+`python tello_combined.py` vliegt de drone met de hand (AZERTY), zonder missies of odometrie.
+Handig om de camera te kalibreren of beelden te maken. Op Linux heeft het pakket `keyboard`
+root-rechten nodig.
+
+| toets | actie |
+|---|---|
+| Z / S | vooruit / achteruit |
+| Q / D | links / rechts |
+| ↑ / ↓ | omhoog / omlaag |
+| A / E | draaien links / rechts |
+| Spatie of T | opstijgen |
+| P | landen |
+| F | foto (`capture_<tijd>.jpg`) |
+| V | onderste camera aan/uit |
+| Esc | afsluiten (de drone landt) |
 
 ## Veiligheid
 
