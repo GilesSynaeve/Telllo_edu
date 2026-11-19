@@ -443,7 +443,11 @@ class DroneApp:
             if land_at_end and cfg.HELIPAD_LAND and self.seen_helipad() is not None:
                 self.land_on_seen_helipad((x0, y0, z0), cfg.DEFAULT_SPEED)
             elif land_at_end:
-                self.safe_land()
+                # like the end of a mission: look for an H around the end of the path
+                # (also one seen only once or twice, just beyond the end of the tape),
+                # centre above it and descend; no H: land here
+                x, y, _, _ = self.pose.get()
+                self.safe_land(spot=(x, y))
         except MissionAborted:
             self.safe_land()
 
