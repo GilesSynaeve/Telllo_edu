@@ -302,10 +302,12 @@ De drone kan op twee manieren vliegen:
   daar (of op een H die hij onderweg zag). Een plas onderweg onderbreekt het volgen voor de
   foto, daarna zoekt hij de strook weer op.
 
-De herkenning (`drone/pathline.py`) zoekt in het beeld van de onderste camera de grootste
-lange, smalle vorm die duidelijk donkerder (`PATH_DARK = True`) of lichter is dan de vloer,
-`PATH_WIDTH_CM` breed en minstens `PATH_MIN_LENGTH_CM` lang (zo tellen de balken van de H en
-papieren plassen niet mee). Ze draait in **elke** vlucht: ook tijdens een geplande route wordt
+De herkenning (`drone/pathline.py`) zoekt in het beeld van de onderste camera de lange, smalle
+vorm die duidelijk donkerder (`PATH_DARK = True`) of lichter is dan de vloer, `PATH_WIDTH_CM`
+breed en minstens `PATH_MIN_LENGTH_CM` lang (zo tellen kleine H's en papieren plassen niet mee).
+Zijn er meer zulke vormen in beeld, dan telt de vorm die **het dichtst onder de drone** ligt,
+niet de grootste: anders kon een dikke balk van een grote H naast de tape het "pad" worden, en
+dan stopte de drone meteen bij het einde van die balk en landde hij op de H. Ze draait in **elke** vlucht: ook tijdens een geplande route wordt
 het pad dat de drone onder zich ziet op de grondkaart getekend (oranje), en in het
 camerabeeld staat de herkende strook als oranje lijn. Pas `PATH_*` in `drone/config.py` aan
 jullie strook aan (kleur, breedte). De simulator heeft een donkere tape-strook van 5 cm, en je
@@ -621,7 +623,12 @@ y = links. Elke sleutel is optioneel: wat ontbreekt blijft zoals in `drone/sim.p
   grijswaarde (0 = zwart, de vloer is ~150).
 * `puddles`: `[x, y, lengte, breedte, draaiing in graden]`, of `[x, y, diameter]`, of
   `{"x": .., "y": .., "l": .., "w": .., "rot": ..}`.
-* `helipad`: `[x, y, papier, H, draaiing]`, `terrain`: `[x0, x1, y0, y1, hoogte]` per doos.
+* `helipad`: één H als `[x, y, papier, H, draaiing]` (of kort `[x, y]`: papier 42, H 26, niet
+  gedraaid), meer H's als lijst van lijsten `[[x, y, ...], [x, y, ...]]`, of `null` voor geen H.
+* `terrain`: `[x0, x1, y0, y1, hoogte]` per doos.
+
+Klopt er iets niet in het bestand, dan zegt de GUI bij het starten welke sleutel en welk object
+fout zijn, in plaats van te crashen.
 
 Leg een plas niet te ver naast het pad: op ~95 cm hoogte ziet de camera maar ongeveer 40 cm
 links en rechts. Een plas die alleen half in beeld komt, telt niet (zijn midden is niet te

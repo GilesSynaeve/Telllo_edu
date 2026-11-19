@@ -42,7 +42,7 @@ SIM_TERRAIN = [(40, 90, 70, 130, 30),     # box under the example square path
                (170, 240, 40, 90, 12),    # plank
                (280, 340, -160, -100, 45)]  # crate
 # Landing pad: white paper with a black H, (x, y, paper size, H size, rotation deg)
-SIM_HELIPAD = (10, -30, 42, 26, 20)
+SIM_HELIPADS = [(10, -30, 42, 26, 20)]
 # Path on the floor: dark tape (world x, y points in cm), width in cm, grey value
 SIM_PATH = ([(-15, 0), (130, 0), (165, 10), (195, 35), (215, 70), (225, 110), (230, 180)],
             5, 55)
@@ -60,6 +60,32 @@ SETTLE_S = 0.8              # the drone hovers this long after a 'go' before ans
 LATENCY_S = 0.15            # video delay
 
 
+def _numbers(item, what, n_min, n_max, defaults=()):
+    """One object from a scene file as a tuple of floats, or a clear error."""
+    if isinstance(item, dict):
+        raise ValueError(f"{what}: verwacht een lijst getallen, kreeg {item!r}")
+    if not isinstance(item, (list, tuple)) or not all(
+            isinstance(v, (int, float)) and not isinstance(v, bool) for v in item):
+        raise ValueError(f"{what}: verwacht een lijst getallen zoals [x, y, ...], kreeg {item!r}")
+    if not n_min <= len(item) <= n_max:
+        n = str(n_min) if n_min == n_max else f"{n_min} tot {n_max}"
+        raise ValueError(f"{what}: verwacht {n} getallen, kreeg {item!r}")
+    vals = [float(v) for v in item]
+    return tuple(vals + list(defaults[len(vals) - n_min:n_max - n_min]))
+
+
+def _objects(value, what):
+    """A key that holds one object ([1, 2, 3]) or several ([[1, 2, 3], [4, 5, 6]])."""
+    if not value:
+        return []
+    if isinstance(value, dict) or (isinstance(value, (list, tuple)) and value
+                                   and all(isinstance(v, (int, float)) for v in value)):
+        return [value]           # one object
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{what}: verwacht een lijst, kreeg {value!r}")
+    return list(value)
+
+
 def load_scene(path):
     """
     Replace the simulated floor by a scene file (JSON, cm, mission frame of the
@@ -70,12 +96,17 @@ def load_scene(path):
          "puddles": [[80, 15, 30, 20, 0], {"x": 180, "y": 40, "l": 40, "w": 25}],
          "helipad": [10, -30, 42, 26, 20],
          "terrain": [[40, 90, 70, 130, 30]]}
+
+    "helipad" may also hold several H's: [[10, -30, 42, 26, 20], [200, 50, 42, 26, 0]].
     """
-    global SIM_PATH, SIM_PUDDLES, SIM_HELIPAD, SIM_TERRAIN
+    global SIM_PATH, SIM_PUDDLES, SIM_HELIPADS, SIM_TERRAIN
     with open(path, encoding="utf-8") as f:
         scene = json.load(f)
+    if not isinstance(scene, dict):
+        raise ValueError(f"{path}: verwacht een JSON-object {{...}}")
     if "path" in scene:
-        pts = [tuple(map(float, p[:2])) for p in scene["path"] or []]
+        pts = [_numbers(p, f"path punt {i + 1}", 2, 2)
+               for i, p in enumerate(scene["path"] or [])]
         if len(pts) == 1:
             raise ValueError("path: minstens 2 punten nodig")
         width = float(scene.get("path_width", SIM_PATH[1] if SIM_PATH else 5))
@@ -83,19 +114,26 @@ def load_scene(path):
         SIM_PATH = (pts, width, grey) if pts else None
     if "puddles" in scene:
         SIM_PUDDLES = []
-        for p in scene["puddles"] or []:
+        for i, p in enumerate(_objects(scene["puddles"], "puddles")):
+            what = f"puddles plas {i + 1}"
             if isinstance(p, dict):
-                p = (p["x"], p["y"], p.get("l", p.get("w", 30)), p.get("w", p.get("l", 30)),
-                     p.get("rot", 0))
-            elif len(p) == 3:          # x, y, diameter
-                p = (p[0], p[1], p[2], p[2], 0)
-            SIM_PUDDLES.append(tuple(float(v) for v in p[:5]) + (0.0,) * (5 - len(p)))
-    if "helipad" in scene:
-        SIM_HELIPAD = tuple(map(float, scene["helipad"])) if scene["helipad"] else None
+                try:
+                    p = [p["x"], p["y"], p.get("l", p.get("w", 30)),
+                         p.get("w", p.get("l", 30)), p.get("rot", 0)]
+                except KeyError as e:
+                    raise ValueError(f"{what}: {e} ontbreekt") from None
+            elif isinstance(p, (list, tuple)) and len(p) == 3:   # x, y, diameter
+                p = [p[0], p[1], p[2], p[2], 0]
+            SIM_PUDDLES.append(_numbers(p, what, 4, 5, defaults=(0.0,)))
+    for key in ("helipad", "helipads"):
+        if key in scene:
+            SIM_HELIPADS = [_numbers(h, f"{key} H {i + 1}", 2, 5, defaults=(42.0, 26.0, 0.0))
+                            for i, h in enumerate(_objects(scene[key], key))]
     if "terrain" in scene:
-        SIM_TERRAIN = [tuple(map(float, t)) for t in scene["terrain"] or []]
+        SIM_TERRAIN = [_numbers(t, f"terrain doos {i + 1}", 5, 5)
+                       for i, t in enumerate(_objects(scene["terrain"], "terrain"))]
     print(f"🗺️  Simulator-scène {path}: pad {len(SIM_PATH[0]) if SIM_PATH else 0} punten, "
-          f"{len(SIM_PUDDLES)} plas(sen), H {'ja' if SIM_HELIPAD else 'nee'}, "
+          f"{len(SIM_PUDDLES)} plas(sen), {len(SIM_HELIPADS)} H('s), "
           f"{len(SIM_TERRAIN)} obstakel(s)")
     return scene
 
@@ -174,8 +212,7 @@ class FakeTello:
         tex = 150 + tex / tex.std() * 10
         coords = (np.arange(n) * TEX_RES - TEX_HALF).astype(np.float32)
         # rows = world x, cols = world y
-        if SIM_HELIPAD:
-            px, py, paper, hs, rot = SIM_HELIPAD
+        for px, py, paper, hs, rot in SIM_HELIPADS:
             ii, jj = np.meshgrid(coords, coords, indexing="ij")   # world x, world y
             a = math.radians(rot)
             u = (ii - px) * math.cos(a) + (jj - py) * math.sin(a)
