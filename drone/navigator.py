@@ -28,8 +28,37 @@ class MissionAborted(Exception):
     pass
 
 
+class FlightInterrupted(Exception):
+    """Yield navigation to a priority flip without landing."""
+
+
 class OdometryLost(Exception):
     pass
+
+
+class MotionEstimate:
+    """Filtered measured velocity; repeated camera samples carry no new speed."""
+
+    def __init__(self):
+        self.previous = None
+        self.velocity = (0.0, 0.0, 0.0)
+
+    def observe(self, position, timestamp):
+        if self.previous is not None:
+            previous_time, previous_position = self.previous
+            dt = timestamp - previous_time
+            if dt <= 0:
+                return self.velocity
+            if dt < 0.7:
+                alpha = dt / (0.2 + dt)
+                raw = tuple(max(-150, min(150, (new - old) / dt))
+                            for new, old in zip(position, previous_position))
+                self.velocity = tuple(old + alpha * (new - old)
+                                      for old, new in zip(self.velocity, raw))
+            else:
+                self.velocity = (0.0, 0.0, 0.0)
+        self.previous = (timestamp, tuple(position))
+        return self.velocity
 
 
 def wrap_deg(a):
@@ -47,6 +76,9 @@ class Pose:
         self._seg = None
         self._hist = collections.deque(maxlen=200)
         self.measured = False   # visual odometry is tracking right now
+        self.position_valid = True  # continuity with the flight origin is known
+        self.local_reference_valid = False  # measured continuity with a saved click, not the origin
+        self.measurement_time = None
         self.quality = 0.0      # last phase correlation response (for the GUI)
         self.vo_disabled = False  # set when the odometry contradicts the commands
         self.vo_validated = False  # odometry matched at least one commanded move
@@ -77,6 +109,9 @@ class Pose:
             self._seg = None
             self._hist.clear()
             self.measured = False
+            self.position_valid = True
+            self.local_reference_valid = False
+            self.measurement_time = None
             self.quality = 0.0
             # a new flight gets a new chance: a wrong measurement in an earlier
             # flight (e.g. a dark floor) must not switch the odometry off for good
@@ -108,6 +143,8 @@ class Pose:
                 return
             if seg["total"] == 0 or seg["measured"] < 0.5 * seg["total"]:
                 self.x, self.y = seg["end"][0], seg["end"][1]
+                self.position_valid = False  # commanded estimate, not a measured arrival
+                self.local_reference_valid = False
             else:
                 self._check_odometry(seg)
             if not seg["z_measured"]:
@@ -143,6 +180,8 @@ class Pose:
         # every correction push the drone further away.
         self.vo_disabled = True
         self.measured = False
+        self.position_valid = False
+        self.local_reference_valid = False
         self.x, self.y = seg["end"][0], seg["end"][1]
         print(f"⚠️  Odometrie mat {along:.0f} cm voor een beweging van {c:.0f} cm: odometrie "
               "UITGESCHAKELD. Controleer CAM_ROTATE_DEG / CAM_FORWARD_SIGN / CAM_LEFT_SIGN / "
@@ -168,6 +207,7 @@ class Pose:
                 if measured:
                     seg["measured"] += dt
             if vo is not None:
+                self.measurement_time = now
                 self.x += vo[0]
                 self.y += vo[1]
             elif not measured and active:
@@ -190,6 +230,27 @@ class Pose:
                         return sample[1:]
             return self.x, self.y, self.z, self.yaw
 
+    def snapshot(self):
+        """Atomically capture coordinates and their tracking validity at a click."""
+        with self._lock:
+            return {"pose": (self.x, self.y, self.z, self.yaw),
+                    "tracking_valid": self.measured and self.position_valid,
+                    "measured": self.measured, "position_valid": self.position_valid,
+                    "local_reference_valid": self.local_reference_valid,
+                    "measurement_time": self.measurement_time,
+                    "quality": self.quality}
+
+    def relocalize_xy(self, dx, dy):
+        """Restore the original frame from a measured known landmark, while idle."""
+        with self._lock:
+            if self._seg is not None or not self.measured or not self.local_reference_valid:
+                return False
+            self.x += dx
+            self.y += dy
+            self.position_valid = True
+            self._hist.clear()  # delayed video must not reuse poses from the old offset
+            return True
+
     # --- frames -----------------------------------------------------------------
     def _body_to_world(self, fwd, left):
         yaw = math.radians(self.yaw)
@@ -206,6 +267,115 @@ class Pose:
         bx = dx * math.cos(yaw) + dy * math.sin(yaw)
         by = -dx * math.sin(yaw) + dy * math.cos(yaw)
         return bx, by
+
+
+class IdleHold:
+    """
+    Keep the drone above one spot while it waits for the next command.
+
+    Real hover tests (2026-11-12): without this the Tello drifted 40-60 cm in
+    20 s, always forward, because nothing corrected it between commands.
+    step() is pure logic (no drone access): it returns the world velocity to
+    send, (0, 0) to hover still, or None when it does not steer at all.
+    Safety: only on a fresh measured position in the mission frame; switched
+    off for the rest of the flight when the error grows instead of shrinking
+    (wrong camera axes) or gets too large.
+    """
+
+    def __init__(self):
+        self.disabled_reason = None
+        self.trace = []
+        self.reset()
+
+    def reset(self, target=None):
+        self.target = None if target is None else (float(target[0]), float(target[1]))
+        self._episode = None          # (time, error) of the smallest error while correcting
+        self._integral = [0.0, 0.0]   # summed error: steady push against a constant drift
+        self._last_step = None
+        self._window = []             # (time, x, y, vx_cmd, vy_cmd): does the drone obey?
+        self._motion = MotionEstimate()
+
+    def disable(self, reason):
+        self.disabled_reason = reason
+        self.target = None
+
+    def _moves_against_commands(self, now, x, y, v):
+        """
+        Wrong camera axes show at once: the drone is commanded one way and the
+        odometry sees it go the other way. Compare the mean command of the last
+        IDLE_HOLD_SIGN_S with the measured displacement over that time. Wind only
+        slows a correctly steered drone down; it doesn't send it backwards at speed.
+        """
+        self._window.append((now, x, y, v[0], v[1]))
+        while self._window and now - self._window[0][0] > cfg.IDLE_HOLD_SIGN_S:
+            self._window.pop(0)
+        t0, x0, y0 = self._window[0][:3]
+        span = now - t0
+        if span < 0.8 * cfg.IDLE_HOLD_SIGN_S:
+            return False
+        cx = sum(w[3] for w in self._window) / len(self._window)
+        cy = sum(w[4] for w in self._window) / len(self._window)
+        speed = math.hypot(cx, cy)
+        if speed < cfg.IDLE_HOLD_SIGN_MIN_CMS:
+            return False              # hardly steering: nothing to compare
+        along = ((x - x0) * cx + (y - y0) * cy) / speed / span   # cm/s in the commanded direction
+        return along < -cfg.IDLE_HOLD_SIGN_BACK_CMS
+
+    def step(self, snapshot, now):
+        if not cfg.IDLE_HOLD or self.disabled_reason:
+            return None
+        if not snapshot.get("position_valid"):
+            self.target = None        # mission frame lost: an old target means nothing
+            return None
+        sample = snapshot.get("measurement_time")
+        if not snapshot.get("measured") or sample is None or now - sample > 0.35:
+            self._episode = None
+            self._window = []
+            return (0.0, 0.0)         # no fresh measurement: hover, never steer on old data
+        x, y = snapshot["pose"][:2]
+        if self.target is None:
+            self.target = (x, y)
+        velocity = self._motion.observe((x, y), sample)
+        ex, ey = self.target[0] - x, self.target[1] - y
+        err = math.hypot(ex, ey)
+        dt = 0.0 if self._last_step is None else min(max(now - self._last_step, 0.0), 0.3)
+        self._last_step = now
+        if err > cfg.IDLE_HOLD_I_ZONE_CM:
+            self._integral = [0.0, 0.0]   # still on the way: no wind-up, no overshoot
+        elif cfg.IDLE_HOLD_I_GAIN > 0:
+            lim = cfg.IDLE_HOLD_I_MAX_CMS / cfg.IDLE_HOLD_I_GAIN
+            self._integral = [max(-lim, min(lim, i + e * dt))
+                              for i, e in zip(self._integral, (ex, ey))]
+        push = (cfg.IDLE_HOLD_I_GAIN * self._integral[0], cfg.IDLE_HOLD_I_GAIN * self._integral[1])
+        if err > cfg.IDLE_HOLD_MAX_ERR_CM:
+            self.disable(f"{err:.0f} cm van het houdpunt (meer dan {cfg.IDLE_HOLD_MAX_ERR_CM})")
+            return (0.0, 0.0)
+        if err <= cfg.IDLE_HOLD_DEADBAND_CM:
+            self._episode = None
+            v = (push[0] - cfg.IDLE_HOLD_DAMPING * velocity[0],
+                 push[1] - cfg.IDLE_HOLD_DAMPING * velocity[1])
+        else:
+            if self._episode is None or err < self._episode[1]:
+                self._episode = (now, err)
+            since, smallest = self._episode
+            # A gust pushes the drone a few cm back; wrong camera axes push it away
+            # without end. Much further than the best point, for a while: stop.
+            if now - since > cfg.IDLE_HOLD_GROWTH_S and err > smallest + cfg.IDLE_HOLD_GROWTH_CM:
+                self.disable(f"fout groeit van {smallest:.0f} naar {err:.0f} cm: "
+                             "controleer de camera-assen (calibrate_camera.py)")
+                return (0.0, 0.0)
+            v = (cfg.IDLE_HOLD_GAIN * ex + push[0] - cfg.IDLE_HOLD_DAMPING * velocity[0],
+                 cfg.IDLE_HOLD_GAIN * ey + push[1] - cfg.IDLE_HOLD_DAMPING * velocity[1])
+        n = math.hypot(*v)
+        if n > cfg.IDLE_HOLD_MAX_CMS:
+            v = (v[0] * cfg.IDLE_HOLD_MAX_CMS / n, v[1] * cfg.IDLE_HOLD_MAX_CMS / n)
+        if self._moves_against_commands(now, x, y, v):
+            self.disable("drone beweegt tegen de stuurrichting in: "
+                         "controleer de camera-assen (calibrate_camera.py)")
+            return (0.0, 0.0)
+        self.trace.append((round(now, 3), round(x, 1), round(y, 1), round(v[0], 1), round(v[1], 1)))
+        del self.trace[:-3000]
+        return v
 
 
 def validate_waypoints(raw):
@@ -235,6 +405,8 @@ class PathFollower:
         self.yaw_hold = cfg.YAW_HOLD
         self._last_rc = 0.0
         self.level = False   # True: never correct the height (fly level, ignore the floor)
+        self.interruptible = False
+        self.flip_pending = threading.Event()
         # interrupt(): called between moves while flying a mission; returns True when
         # it moved the drone elsewhere (e.g. to photograph a puddle), the leg then
         # continues from wherever the drone is now
@@ -244,8 +416,24 @@ class PathFollower:
 
     def rc(self, lr, fb, ud, yv):
         """send_rc_control that remembers when the sticks were last used."""
-        self._last_rc = time.time()
+        if any((lr, fb, ud, yv)):
+            self._last_rc = time.time()
         self.tello.send_rc_control(lr, fb, ud, yv)
+
+    def settle_before_flip(self):
+        """Wait only for the remaining RC transition; never retry a flip."""
+        if self._last_rc <= 0:
+            return 0.0
+        remaining = cfg.RC_SETTLE_S - (time.time() - self._last_rc)
+        if remaining <= 0:
+            return 0.0
+        started = time.time()
+        self.rc(0, 0, 0, 0)
+        while remaining > 0:
+            self._check_abort()
+            time.sleep(min(0.02, remaining))
+            remaining = cfg.RC_SETTLE_S - (time.time() - self._last_rc)
+        return max(0.0, time.time() - started)
 
     def command(self, fn, *args, settle=True):
         """
@@ -276,6 +464,8 @@ class PathFollower:
     def _check_abort(self):
         if self.abort.is_set():
             raise MissionAborted()
+        if self.interruptible and self.flip_pending.is_set():
+            raise FlightInterrupted()
 
     # ------------------------------------------------------------------ mission
     def fly(self, waypoints, speed, on_waypoint=None, mode=None, fine=None):
@@ -344,10 +534,13 @@ class PathFollower:
     def _interrupted(self):
         return bool(self.interrupt and self.interrupt())
 
-    def move_to(self, target, speed):
+    def move_to(self, target, speed, require_tracking=False):
         while True:
             self._check_abort()
-            self._interrupted()   # a detour: the next step starts from the new position
+            if require_tracking and not (self.pose.measured and self.pose.position_valid):
+                raise OdometryLost("Global return requires continuous measured position")
+            if not require_tracking:
+                self._interrupted()   # a detour: the next step starts from the new position
             self.correct_yaw()
             x, y, z, _ = self.pose.get()
             dx, dy = target[0] - x, target[1] - y
@@ -451,7 +644,7 @@ class PathFollower:
         Tello's own landing from 80 cm slides sideways much more.
         Returns False (nothing sent) when the odometry isn't tracking.
         """
-        if not self.pose.measured:
+        if not self.pose.measured or not self.pose.position_valid:
             return False
         self.hold_position((*target_xy, self.pose.get()[2]))
         period = 1.0 / cfg.RC_HZ
@@ -461,7 +654,7 @@ class PathFollower:
             while time.time() < deadline:
                 self._check_abort()
                 x, y, z, _ = self.pose.get()
-                if z <= cfg.LAND_HOVER_CM or not self.pose.measured:
+                if z <= cfg.LAND_HOVER_CM or not self.pose.measured or not self.pose.position_valid:
                     break
                 vx, vy = (cfg.RC_GAIN * (t - c) for t, c in zip(target_xy, (x, y)))
                 n = math.hypot(vx, vy)
@@ -473,56 +666,111 @@ class PathFollower:
             self.rc(0, 0, 0, 0)
         return True
 
-    def hold_position(self, target, tol=None, timeout=None, settle=0.0):
+    def hold_position(self, target, max_speed=20.0, gain=None,
+                      tolerance_cm=None, timeout_s=None, settle_s=0.0,
+                      allow_local_reference=False, damping=0.0, max_vertical_speed=None,
+                      max_error_growth_cm=15, z_tolerance_cm=None):
+        """Precise positioning on a waypoint with small rc corrections.
+
+        z_tolerance_cm: separate altitude band (default: derived from tolerance_cm).
         """
-        Precise positioning on a waypoint with small rc corrections. Done when
-        closer than tol (default FINE_TOL_CM) for `settle` seconds, so the drone
-        doesn't coast past the spot right after the sticks are released.
-        """
-        if not self.pose.measured:
-            return
-        tol = tol or cfg.FINE_TOL_CM
-        timeout = timeout or cfg.FINE_TIMEOUT_S
+        def reference_valid():
+            return self.pose.position_valid or (allow_local_reference and self.pose.local_reference_valid)
+
+        self.last_hold_result = {"target_cm": tuple(target), "reason": "running", "trace": []}
+        def finish(result, reason):
+            self.last_hold_result.update(confirmed=result, reason=reason)
+            return result
+
+        if not self.pose.measured or not reference_valid():
+            return finish(False, "tracking_unavailable")
         t0 = time.time()
-        deadline = t0 + timeout
+        timeout_s = cfg.FINE_TIMEOUT_S if timeout_s is None else timeout_s
+        deadline = t0 + timeout_s
+        tolerance = cfg.FINE_TOL_CM if tolerance_cm is None else tolerance_cm
+        z_tolerance = 1.5 * tolerance if tolerance_cm is None else tolerance
+        if z_tolerance_cm is not None:
+            z_tolerance = z_tolerance_cm
+        # A noisy derivative must not reject a position that stays inside the
+        # band for the full settling period. Still reject fast crossings.
+        settle_speed = max(3.0, min(6.0, tolerance / max(settle_s, 0.5)))
+        stable_since = None
         period = 1.0 / cfg.RC_HZ
-        max_speed = 20.0
+        gain = cfg.RC_GAIN if gain is None else gain
+        self.last_hold_result.update(gain=gain, damping=damping, timeout_s=timeout_s,
+                                     max_speed=max_speed, max_vertical_speed=max_vertical_speed)
         ex = ey = 0.0
-        ix = iy = 0.0     # integral: pushes harder against a steady drift (air flow)
-        inside = None     # since when the drone is within tol
         e0 = None
+        motion = MotionEstimate()
         try:
             while time.time() < deadline:
                 self._check_abort()
+                if not reference_valid():
+                    return finish(False, "reference_lost")
                 if not self.pose.measured:
-                    return
-                x, y, _, _ = self.pose.get()
+                    # Acceleration/brief blur can interrupt floor tracking.
+                    # Hover until it returns within the existing deadline;
+                    # never continue steering on an old error or claim success.
+                    stable_since = None
+                    self.rc(0, 0, 0, 0)
+                    time.sleep(period)
+                    continue
+                snapshot = self.pose.snapshot()
+                x, y, z, _ = snapshot["pose"]
+                sample_time = snapshot["measurement_time"]
+                now = time.time()
+                if sample_time is not None and now - sample_time > 0.35:
+                    stable_since = None
+                    self.rc(0, 0, 0, 0)
+                    time.sleep(period)
+                    continue
+                velocity = motion.observe((x, y, z), now if sample_time is None else sample_time)
                 e = math.hypot(target[0] - x, target[1] - y)
                 e0 = e if e0 is None else e0
                 # safety: the error must shrink. If not, the camera direction is
                 # wrong (not yet checked this flight): stop instead of wandering off.
-                if e > e0 + 15 or (time.time() - t0 > 2.5 and e > 0.9 * e0 + 5):
+                if e > e0 + max_error_growth_cm or (time.time() - t0 > 2.5 and e > 0.9 * e0 + 5):
                     print("⚠️  Nauwkeurig positioneren komt niet dichter: gestopt")
-                    return
-                x, y, z, _ = self.pose.get()
-                ex, ey, ez = target[0] - x, target[1] - y, self._dz(target[2] - z)
-                if math.hypot(ex, ey) < tol and abs(ez) < 1.5 * max(tol, cfg.FINE_TOL_CM):
-                    inside = inside or time.time()
-                    if time.time() - inside >= settle:
-                        return
-                else:
-                    inside = None
-                lim = cfg.HOLD_I_MAX_CMS / max(cfg.HOLD_I_GAIN, 1e-6)
-                ix = max(-lim, min(lim, ix + ex * period))
-                iy = max(-lim, min(lim, iy + ey * period))
-                v = [cfg.RC_GAIN * ex + cfg.HOLD_I_GAIN * ix,
-                     cfg.RC_GAIN * ey + cfg.HOLD_I_GAIN * iy, cfg.RC_GAIN * ez]
+                    return finish(False, "error_not_decreasing_check_camera_calibration")
+                # Explicit precision also corrects small altitude errors; the
+                # normal mission deadband must not erase a flip's height error.
+                dz = target[2] - z
+                ex, ey, ez = target[0] - x, target[1] - y, (dz if tolerance_cm is not None else self._dz(dz))
+                xy_slow = not damping or math.hypot(velocity[0], velocity[1]) < settle_speed
+                z_slow = not damping or abs(velocity[2]) < settle_speed
+                if math.hypot(ex, ey) < tolerance and abs(ez) < z_tolerance and xy_slow and z_slow:
+                    stable_since = time.time() if stable_since is None else stable_since
+                    if time.time() - stable_since >= settle_s:
+                        return finish(True, "stable_within_tolerance")
+                    self.rc(0, 0, 0, 0)
+                    time.sleep(period)
+                    continue
+                stable_since = None
+                v = [gain * ex - damping * velocity[0], gain * ey - damping * velocity[1],
+                     (min(gain, 1.0) if damping else gain) * ez - damping * velocity[2]]
+                # A fast pass through the tolerance band is not an arrival.
+                # Brake residual measured motion instead of coasting past the
+                # target, then leave a settled axis alone.
+                if math.hypot(ex, ey) < tolerance:
+                    v[0], v[1] = ((0.0, 0.0) if xy_slow else
+                                  (-damping * velocity[0], -damping * velocity[1]))
+                if abs(ez) < z_tolerance:
+                    v[2] = 0.0 if z_slow else -damping * velocity[2]
+                if max_vertical_speed is not None:
+                    v[2] = max(-max_vertical_speed, min(max_vertical_speed, v[2]))
                 n = math.sqrt(sum(c * c for c in v))
                 if n > max_speed:
                     v = [c * max_speed / n for c in v]
+                self.last_hold_result["trace"].append(
+                    [round(time.time() - t0, 3), round(x, 2), round(y, 2), round(z, 2),
+                     *(round(c, 2) for c in v)])
+                # Outside tolerance even a fine correction must overcome the
+                # drone's stick dead zone. Stop inside tolerance, rather than
+                # spending seconds sending tiny ineffective commands.
                 self.send_velocity(*v, min_units=cfg.RC_MIN_UNITS)
                 time.sleep(period)
-            print(f"ℹ️  Nauwkeurig positioneren: na {timeout}s nog "
+            print(f"ℹ️  Nauwkeurig positioneren: na {timeout_s}s nog "
                   f"{math.hypot(ex, ey):.0f} cm naast het punt")
+            return finish(False, "timeout")
         finally:
             self.rc(0, 0, 0, 0)

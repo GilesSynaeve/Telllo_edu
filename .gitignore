@@ -4,6 +4,7 @@ capture_*.jpg
 venv/
 .venv/
 dataset/
+flight_logs/
 yolo-env
 runs
 models

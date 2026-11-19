@@ -103,19 +103,32 @@ juiste plek.
 tello_gui.py          ← start hier: grafische besturing (pad plannen, grondkaart, 3D, terrein, sensoren, camera)
 tello_combined.py     ← live vliegen met het toetsenbord (ZQSD), handig om te testen/kalibreren
 drone/
-    app.py            kern: missies afvliegen, pad volgen, plassen fotograferen, landen op een H, Jetson-koppeling
+    app.py            kern: missies afvliegen, pad volgen, plassen fotograferen, landen op een H, salto, Jetson-koppeling
+    connection.py     verbinden met de drone (AP of STA), met duidelijke foutmeldingen
+    network.py        AP/STA-instellingen en de Wi-Fi-wizard (zie docs/wifi-ap-sta.md)
+    video.py          videostream: in STA alleen "aan" als er echt beelden binnenkomen
     config.py         alle instellingen (netwerk, snelheid, geofence, camera, landen, plassen, pad)
     navigator.py      positie + waypoints afvliegen (stap- of vloeiende modus)
     odometry.py       meet de echte beweging: camera (visuele odometrie), kompas, hoogte
     downcam.py        onderste camera: grijs + bijsnijden, pixel → coördinaat
-    helipad.py        H-landingsplatform herkennen (zonder training)
+    helipad.py        H-landingsplatform herkennen (zonder training) en volgen tussen beelden
+    pad_recovery.py   H even kwijt tijdens het landen: terugsturen naar de laatste plek
+    registration.py   vloerbeeld na een salto terugvinden in het beeld van ervoor (terugkeren)
+    camera_calibration.py  camerarichting afleiden uit met de hand verschoven beelden (motoren uit)
     pathline.py       strook (tape/papier) op de vloer herkennen
     puddles.py        plassen herkennen met een getraind YOLO-model + samenvoegen
     jetson_link.py    UDP/JSON-communicatie met de Jetson
     telemetry.py      alle sensorwaarden over tijd + terreinkaart (barometer − ToF)
     sim.py            simulator: alles testen zonder drone (`--sim`), met dozen, tape en plassen op de vloer
     keypress.py       toetsenbord-hulp voor tello_combined.py
-gui/                  onderdelen van de GUI: thema, instrumenten, grondkaart, padweergave, 3D-weergave, kaart
+gui/                  onderdelen van de GUI: thema, instrumenten, grondkaart, padweergave, 3D-weergave, kaart,
+                      verbindingsvenster (AP/STA) en wat de salto-knop en de positieweergave mogen tonen
+tests/                unit tests (python -m unittest tests.test_...) en een volledige simulatorvlucht
+                      (python -X utf8 -m tests.sim_scenario)
+ground_check.py       controles met de motoren uit: telemetrie, camera's, ToF, H-herkenning
+calibrate_camera.py   camerarichting meten zonder te vliegen (drone met de hand verschuiven)
+fake_jetson.py        nep-Jetson om de UDP-koppeling te testen (zie docs/jetson-koppeling.md)
+lancer_gui.bat        Windows: start de GUI met de Python van .venv
 json_flights/         opgeslagen vluchten (JSON), te openen met Opslaan/Laden in de GUI
 sim_scenes/           zelfgemaakte vloeren voor de simulator (pad, plassen, H, dozen)
 models/               hier komt het getrainde plasmodel (puddles.pt), niet in git
@@ -134,10 +147,16 @@ plassen) en `runs/` (trainingen). Die staan in `.gitignore`.
  Jetson  ◀──(UDP 9001: status / events ...)──  Laptop  ◀──(video onderste camera)──
 ```
 
-De laptop hangt aan de Wi-Fi van de Tello. De Jetson moet de laptop via een **tweede netwerk**
-kunnen bereiken (ethernetkabel of tweede Wi-Fi-adapter). Een alternatief: de Tello EDU in
-*station mode* aan een router hangen (`ap <ssid> <wachtwoord>` sturen), dan zitten Tello,
-laptop en Jetson op hetzelfde netwerk en maak je de drone aan met `Tello(host="<ip van de tello>")`.
+Bij het starten van `tello_gui.py` kies je **AP** (directe Tello-Wi-Fi) of **STA**
+(drone en laptop op de thuisrouter, met internet op de laptop). De verbindingswizard
+kan STA configureren vanuit AP en het lokale IP zoeken. Wachtwoorden worden niet opgeslagen.
+**Video in STA is firmware-afhankelijk**: zonder bevestigde ondercamera zijn visuele
+navigatie, missies, salto-terugkeer en H-landing uitgeschakeld.
+Zie de [volledige AP/STA-handleiding en herstelprocedure](docs/wifi-ap-sta.md).
+
+In AP heeft de Jetson een tweede netwerk nodig om de laptop te bereiken.
+De Jetson-link luistert standaard alleen op `127.0.0.1`; voor een externe Jetson
+blijven de netwerkparameters in `drone/config.py` van toepassing.
 
 ## Coördinatenstelsel (“mission frame”)
 
@@ -386,13 +405,14 @@ ook zonder wind. Met werkende odometrie corrigeert het script dat nu:
 
 * de odometrie blijft meten terwijl de drone stijgt of daalt (vroeger begon ze bij elke
   hoogteverandering opnieuw, waardoor het afschuiven tijdens het opstijgen niet gemeten werd);
-* tijdens het stijgen of dalen zoomt het camerabeeld in of uit; de odometrie schaalt het vorige
-  beeld eerst naar de nieuwe hoogte (met de hoogte van het moment dat het beeld genomen werd).
+* tijdens het stijgen of dalen zoomt het camerabeeld in of uit; de odometrie brengt het nieuwe
+  beeld eerst terug naar de schaal en richting van het referentiebeeld (met de hoogte en yaw van
+  het moment dat het beeld genomen werd) en controleert de overeenkomst (`VO_MIN_CORRELATION`).
   Zonder dat las ze de zoom als een verschuiving naar iets dat opvalt (de H, een tegelrand) en
   “zag” ze ~20 cm afschuiven dat er niet was, waarna de drone die afstand de andere kant op vloog;
-* na het opstijgen gaat de drone terug boven de startplek (`TAKEOFF_RECENTER`), tot op
-  `TAKEOFF_RECENTER_TOL_CM` (4 cm) en een halve seconde stil daar, met een extra duw tegen een
-  blijvende luchtstroom (`HOLD_I_GAIN`). Daarna toont het log `🎯 Boven de startplek (x, y cm)`;
+* na het opstijgen gaat de drone terug boven de startplek (`TAKEOFF_RECENTER`), tot op 3 cm,
+  maximaal 3 s en gedempt; wordt de afwijking groter in plaats van kleiner (verkeerde
+  camerakalibratie), dan stopt de correctie meteen;
 * aan het einde van een missie daalt hij langzaam tot `LAND_HOVER_CM` (30 cm) terwijl hij boven
   het laatste punt blijft, pas daarna volgt de gewone `land` (`PRECISE_LAND`). De knop *Landen*
   en een noodlanding landen meteen, zonder deze stap.
@@ -428,17 +448,17 @@ Ziet de drone tijdens een missie (met `land_at_end`) ergens een landingsplatform
 3. De drone stuurt zich boven het midden van de H en daalt alleen als hij erboven gecentreerd
    is (`HELIPAD_CENTER_TOL_CM`, 6 cm). De H wordt in elk camerabeeld opnieuw gemeten, dus hij
    blijft corrigeren tijdens het dalen. Het midden is het midden van de dwarsbalk (de "-").
-4. Onder ~45 cm past de H niet meer in het beeld. Dan volgt hij alleen nog die dwarsbalk:
-   halverwege de binnenkanten van de twee staande balken (`find_center`). Zo blijft hij tot
-   op ~1 cm meten tot vlak boven de H.
-5. Op `HELIPAD_FINAL_CM` (25 cm) wacht hij tot hij minstens `HELIPAD_LAND_STABLE_S` (0,5 s)
-   binnen `HELIPAD_LAND_TOL_CM` (2,5 cm) van het midden hangt, en stuurt dan meteen `land`.
-   Een kleine blijvende duw (`HELIPAD_KI`) houdt hem op zijn plek tegen wind en drift.
-   Kwijt in het laatste stuk: hij stijgt een beetje tot hij de H terugziet en daalt opnieuw.
+   Alleen een verse meting (`HELIPAD_CONTROL_MAX_AGE_S`) mag de drone sturen; een korte
+   gemiste detectie wordt overbrugd door de tracker, nooit door een oud beeld.
+4. Op `HELIPAD_FINAL_CM` (50 cm, voor de H uit het beeld valt) wacht hij tot hij langzaam
+   (`HELIPAD_FINAL_SPEED_CMS`) en binnen `HELIPAD_FINAL_TOL_CM` (3 cm) boven het midden hangt,
+   en pas dan volgt `land`. H kwijt: hij blijft hangen en zoekt kort terug; na 3 s geen H wordt
+   de H-landing afgebroken (geen blinde landing op oude coördinaten).
 
-In de simulator (16 vluchten, met wind en zijwaartse drift bij het landen) staat de drone bij
-`land` gemiddeld 2 cm naast het midden (eerst 6,5 cm), en na de landing 7 cm (eerst 14 cm).
-Het laatste stuk is de drift van de `land` zelf.
+*Niet overgenomen bij het samenvoegen (merge-main):* de variant van `main` die onder ~45 cm de
+dwarsbalk volgt tot 25 cm (`find_center`, integrerende duw). `HelipadDetector.find_center`
+bestaat nog in `drone/helipad.py`, maar wordt niet gebruikt; die variant moet eerst met de
+tests van deze branch en op de echte drone vergeleken worden.
 
 De detectie werkt zonder training: een donkere H op licht papier of een lichte H op een donker
 platform, in elke richting gedraaid, vierkant of hoger dan breed. Andere vormen (vlekken,
@@ -654,8 +674,9 @@ gevonden, op 1 tot 4 cm van hun echte plek, elk met een foto.
 
 1. **Beeld controleren.** Start `tello_combined.py` (de onderste camera staat meteen aan, V schakelt)
    en maak een foto (F).
-   Kijk of het onderste camerabeeld in zwarte randen zit. `AUTO_CROP` vangt dat normaal op;
-   anders zet je `DOWNCAM_CROP = (x, y, w, h)`.
+   Kijk of het onderste camerabeeld in zwarte randen zit. Zo ja, zet `DOWNCAM_CROP = (x, y, w, h)`
+   (`AUTO_CROP` staat uit: donkere stukken vloer werden soms als rand weggesneden, waardoor het
+   midden van het beeld verschoof).
 2. **Beeldhoek (`CAM_HFOV_DEG`).** Houd de drone op een bekende hoogte `h` (cm) boven een
    meetlat en lees af hoeveel cm `W` er horizontaal in beeld past:
    `CAM_HFOV_DEG = 2 * atan((W / 2) / h)` (in graden).

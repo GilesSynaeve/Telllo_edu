@@ -40,6 +40,9 @@ from drone import config as cfg  # noqa: E402
 from drone.app import DroneApp  # noqa: E402
 from drone.navigator import validate_waypoints  # noqa: E402
 from gui import theme  # noqa: E402
+from gui.connection_dialog import AP_RESET_HELP, choose_connection  # noqa: E402
+from drone.network import ConnectionOptions  # noqa: E402
+from gui.tracking import TrajectoryHistory, display_tracking, flip_readiness  # noqa: E402
 from gui import map3d  # noqa: E402
 from gui.groundmap import GroundMap  # noqa: E402
 from gui.map3d import VIEWS, Map3D  # noqa: E402
@@ -51,7 +54,7 @@ from gui.widgets import (AttitudeIndicator, BatteryBar, Compass, HeightGauge,  #
                          LineChart, Segmented, StatTile, Toast, card)
 
 TICK_MS = 33                    # instruments, camera, top bar (~30 fps)
-PLOT_PATH_S = 0.15              # matplotlib views are slower: redraw less often
+PLOT_PATH_S = 0.5               # matplotlib views are slower: redraw less often (~70 ms each)
 PLOT_3D_S = 0.10
 GROUND_S = 0.25                 # lay a camera frame on the ground map this often
 PLOT_MAP_S = 0.15
@@ -99,7 +102,9 @@ class TelloGUI:
         self.waypoints = []          # editable draft path [(x, y, z), ...]
         self.history = []            # undo stack of earlier waypoint lists
         self.sel = None              # selected waypoint index
-        self.trail = []              # flown positions
+        self.trajectory = TrajectoryHistory()
+        self.trail = self.trajectory.global_points
+        self.local_trail = self.trajectory.local_points
         self.trail_mission = None
         self.trail_frame = None      # app.frame_id the trail belongs to
         self.mission_count = 0
@@ -124,6 +129,10 @@ class TelloGUI:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self._build_topbar()
+        if getattr(app, "network_mode", "ap") == "sta":
+            text = f"STA · {app.tello.address[0]} · " + (app.video_warning or "Vidéo inférieure reçue et confirmée")
+            tk.Label(root, text=text, bg=C["bg"], fg=C["warn"] if app.video_warning else C["ok"],
+                     wraplength=1180, anchor="w", justify="left").pack(fill=tk.X, padx=10, pady=(0, 6))
         body = ttk.Frame(root, style="Bg.TFrame")
         body.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
         body.columnconfigure(1, weight=1)
@@ -139,6 +148,7 @@ class TelloGUI:
         self._build_left(left)
         self._build_center(center)
         self._build_right(right)
+        self._apply_capabilities()
         self._bind_keys()
         self._validate_entries()
         self.toast.show("Klik op de kaart om punten toe te voegen, of vul x, y, z in.", "info", 8)
@@ -180,18 +190,30 @@ class TelloGUI:
         outer.pack(side=tk.BOTTOM, fill=tk.X, pady=(8, 0))
         grid = ttk.Frame(box, style="Card.TFrame")
         grid.pack(fill=tk.X)
+        self.vision_buttons = []
         for text, cmd, color, r, c in (
                 ("▶  Start missie", self.start_mission, "#238453", 0, 0),
                 ("Ga naar punt", self.goto_selected, "#1f6fb5", 0, 1),
                 ("Opstijgen", lambda: self.app.submit({"type": "takeoff"}), "#3a4757", 1, 0),
-                ("Landen  (L)", self.land, "#c2701b", 1, 1)):
-            tk_button(grid, text, cmd, color).grid(row=r, column=c, sticky="ew", padx=2, pady=2)
-        tk_button(grid, "Landen op de H  (H)", self.helipad_land, "#2f7d6d").grid(
-            row=2, column=0, sticky="ew", padx=2, pady=2)
+            ("Landen  (L)", self.land, "#c2701b", 1, 1)):
+            button = tk_button(grid, text, cmd, color)
+            button.grid(row=r, column=c, sticky="ew", padx=2, pady=2)
+            if r == 0:
+                self.vision_buttons.append(button)
+        button = tk_button(grid, "Landen op de H  (H)", self.helipad_land, "#2f7d6d")
+        button.grid(row=2, column=0, sticky="ew", padx=2, pady=2)
+        self.vision_buttons.append(button)
         tk_button(grid, "↺  Reset omgeving", self.reset_environment, "#5a4a8a").grid(
             row=2, column=1, sticky="ew", padx=2, pady=2)
-        tk_button(grid, "〰  Volg pad op de vloer", self.follow_path, "#8a5a1f").grid(
-            row=3, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
+        button = tk_button(grid, "〰  Volg pad op de vloer", self.follow_path, "#8a5a1f")
+        button.grid(row=3, column=0, columnspan=2, sticky="ew", padx=2, pady=2)
+        self.vision_buttons.append(button)
+        # Salto button: request a flip via the mission thread
+        def _salto():
+            self._flip()
+        self.flip_button = tk_button(box, "🔁  Salto", _salto, "#8a5a2f")
+        self.flip_button.pack(fill=tk.X, padx=2, pady=(6, 0))
+        self._refresh_flip_button()
         grid.columnconfigure(0, weight=1, uniform="b")
         grid.columnconfigure(1, weight=1, uniform="b")
         tk_button(box, "⚠  NOODSTOP – motoren uit  (X)", self.emergency, "#c62f37",
@@ -430,7 +452,8 @@ class TelloGUI:
         row = ttk.Frame(box, style="Card.TFrame")
         row.pack(fill=tk.X, pady=(6, 0))
         self.show_dets = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row, text="Detecties tonen", variable=self.show_dets).pack(side=tk.LEFT)
+        self.detect_check = ttk.Checkbutton(row, text="Detecties tonen", variable=self.show_dets)
+        self.detect_check.pack(side=tk.LEFT)
         self.record_btn = ttk.Button(row, text="● Opnemen (dataset)", style="Small.TButton",
                                      command=self.toggle_record)
         self.record_btn.pack(side=tk.RIGHT)
@@ -450,7 +473,7 @@ class TelloGUI:
         tiles.pack(fill=tk.X, pady=(6, 0))
         self.tiles = {}
         for i, (key, label, unit) in enumerate((
-                ("tof", "ToF (afstand grond)", "cm"), ("alt", "Barometer-hoogte", "cm"),
+                ("tof", "ToF: tot oppervlak", "cm"), ("alt", "Barometer: vanaf start", "cm"),
                 ("ground", "Terrein onder drone", "cm"), ("speed", "Snelheid", "cm/s"),
                 ("temp", "Temperatuur", "°C"), ("odo", "Odometrie", ""))):
             t = StatTile(tiles, label, unit, width=6)
@@ -466,6 +489,12 @@ class TelloGUI:
                                   wraplength=330)
         self.pad_info.pack(anchor=tk.W, fill=tk.X)
         self._pad_text = None
+
+    def _apply_capabilities(self):
+        if not getattr(self.app, "vision_navigation_available", True):
+            for button in self.vision_buttons + [self.record_btn, self.detect_check] + list(self.cam_seg.buttons.values()):
+                button.configure(state=tk.DISABLED)
+            self.show_dets.set(False)
 
     def _bind_keys(self):
         # Sneltoetsen voor veelgebruikte acties tijdens plannen en vliegen.
@@ -505,7 +534,9 @@ class TelloGUI:
         self.toast.tick()
 
         # displayed pose glides towards the measured pose (smooth animation)
-        pose = app.pose.get()
+        snapshot = app.pose.snapshot()
+        pose = snapshot["pose"]
+        tracking_mode, _ = display_tracking(snapshot, app.airborne, now)
         if self.show is None:
             self.show = list(pose)
         else:
@@ -522,12 +553,8 @@ class TelloGUI:
             if app.frame_id != self.trail_frame:
                 self.show = list(pose)   # new frame: jump, don't glide from the old one
             self.trail_mission, self.trail_frame = app.mission_id, app.frame_id
-            self.trail = []
+        self.trajectory.update(app.frame_id, tracking_mode, pose)
         self.flight_log.update(app, slow=now >= self._next["side"])
-        x, y, z, _ = pose
-        if app.airborne and (not self.trail or
-                             max(abs(a - b) for a, b in zip(self.trail[-1], (x, y, z))) > 2):
-            self.trail.append((x, y, z))
 
         self._topbar(tel, now)
         self.attitude.set(tel.get("pitch"), tel.get("roll"))
@@ -536,8 +563,7 @@ class TelloGUI:
                         tel.get("tof") if app.airborne else None, tel.get("ground"))
         for w in (self.attitude, self.compass, self.height, self.battery):
             w.tick()
-        if self._tick_n % 2 == 0:
-            self.update_camera(tel)
+        self.update_camera(tel)   # redraws only when a new image arrived
 
         if now >= self._next["side"]:
             self._next["side"] = now + 0.2
@@ -594,6 +620,8 @@ class TelloGUI:
             except Exception:
                 battery = None
         self.battery.set(battery)
+        self._flip_battery = battery
+        self._refresh_flip_button()
         v = self.top_vars
         if app.airborne and self.takeoff_time:
             s = int(now - self.takeoff_time)
@@ -602,12 +630,15 @@ class TelloGUI:
             v["time"].configure(text="⏱ --:--", fg=C["muted"])
         v["height"].configure(text=f"↕ {self.show[2]:.0f} cm", fg=C["text"] if app.airborne
                               else C["muted"])
-        if not app.airborne:
+        mode, note = display_tracking(app.pose.snapshot(), app.airborne, now)
+        if mode == "ground":
             v["odo"].configure(text="odometrie –", fg=C["muted"])
-        elif app.pose.measured:
+        elif mode == "global":
             v["odo"].configure(text=f"odometrie ✔ {app.pose.quality:.2f}", fg=C["ok"])
+        elif mode == "local":
+            v["odo"].configure(text=note, fg=C["warn"])
         else:
-            v["odo"].configure(text="odometrie ✖ (commando's)", fg=C["warn"])
+            v["odo"].configure(text="POSITIE ONBEKEND / SCHATTING", fg=C["warn"])
         rx = getattr(app.link, "last_rx", None)
         if rx is None:
             v["jetson"].configure(text="Jetson: geen contact", fg=C["muted"])
@@ -716,26 +747,30 @@ class TelloGUI:
         # Verzamel alle data die de kaart nodig heeft in één scene-object.
         terrain = self.app.telemetry.terrain if hasattr(self.app, "telemetry") else None
         x, y = self.show[0], self.show[1]
+        mode, note = display_tracking(self.app.pose.snapshot(), self.app.airborne, time.time())
         return {
             "pose": tuple(self.show), "pitch": tel.get("pitch"), "roll": tel.get("roll"),
             "waypoints": list(self.waypoints), "selected": self.sel,
             "mission": list(self.app.current_waypoints), "reached": self.app.waypoints_reached,
             "trail": self.trail, "airborne": self.app.airborne,
-            "helipad": self.app.seen_helipad(),
+            "position_valid": mode in ("ground", "global"),
+            "position_mode": mode, "position_note": note,
+            "local_trail": self.local_trail,
+            "helipad": self.app.seen_helipad(local=not self.app.pose.position_valid),
             # (x, y, id, radius cm) of every puddle the model found
             "puddles": [(p.x, p.y, p.id, (p.w_cm + p.h_cm) / 4)
                         for p in self.app.puddle_detector.puddles()],
-            "terrain": terrain.snapshot() if terrain and self.terrain3d.get() else [],
-            "terrain_version": (terrain.version if terrain else 0, self.terrain3d.get()),
-            "ground_under": terrain.elevation_at(x, y) if terrain else None,
-            "footprint": self._footprint(tel),
+            "terrain": terrain.snapshot() if terrain and self.terrain3d.get() and self.app.pose.position_valid else [],
+            "terrain_version": (terrain.version if terrain else 0, self.terrain3d.get(), self.app.pose.position_valid),
+            "ground_under": terrain.elevation_at(x, y) if terrain and self.app.pose.position_valid else None,
+            "footprint": self._footprint(tel) if mode != "lost" else None,
         }
 
     def _update_map(self, tel):
         # Vernieuw de kaartweergave met terrein, pad, selectie en obstakels.
         terrain = self.app.telemetry.terrain
         s = self._scene(tel)
-        s["terrain"] = terrain.snapshot()
+        s["terrain"] = terrain.snapshot() if self.app.pose.position_valid else []
         s["terrain_version"] = terrain.version
         s["profile"] = terrain.profile_copy()
         if self._summary is None or self._summary[0] != terrain.version:
@@ -785,10 +820,13 @@ class TelloGUI:
 
     def update_pad_info(self):
         # Toon informatie over de gedetecteerde H-landingsplaats en assenstelsel.
-        pad = self.app.seen_helipad()
-        lines = [f"H gezien op  x {pad[0]:.0f}, y {pad[1]:.0f} cm" if pad else
-                 "Nog geen H gezien (deze vlucht).",
-                 ""]
+        local = not self.app.pose.position_valid
+        pad = self.app.seen_helipad(local=local)
+        message = (f"H onthouden: x {pad[0]:.0f}, y {pad[1]:.0f} cm"
+                   + (" (lokaal)" if local else "") if pad else
+                   "H gezien; positie nog onbekend." if self.app.ever_seen_h else
+                   "Nog geen H gezien (deze vlucht).")
+        lines = [message, ""]
         det = self.app.puddle_detector
         puddles = det.puddles()
         if not det.enabled:
@@ -803,8 +841,8 @@ class TelloGUI:
         else:
             lines += [f"Nog geen plassen gevonden (model {det.status}).", ""]
         lines += ["Assen: (0, 0) = startplek van de drone, x = richting van de neus "
-                  "(voorcamera), y = links."
-                  + (" Wordt bij elke start opnieuw gezet." if cfg.RESET_FRAME_ON_TAKEOFF else "")]
+                 "(voorcamera), y = links."
+                 + (" Wordt bij elke start opnieuw gezet." if cfg.RESET_FRAME_ON_TAKEOFF else "")]
         text = "\n".join(lines)
         if text != self._pad_text:
             self._pad_text = text
@@ -815,10 +853,16 @@ class TelloGUI:
         app = self.app
         frame = app.frame_reader.frame if hasattr(app, "frame_reader") else None
         vis = app.latest_vis() if (self.show_dets.get() and app.downvision_enabled) else None
+        source = vis if vis is not None else frame
+        if source is not None and source is getattr(self, "_cam_source", None):
+            return            # same image as on screen: nothing to redraw
+        self._cam_source = source
         self.cam.delete("all")
         if frame is None and vis is None:
-            self.cam.create_text(self.cam_w / 2, self.cam_h / 2, text="Geen camerabeeld",
-                                 fill=C["muted"], font=F["base"])
+            message = ("STA : vidéo indisponible\nNavigation visuelle désactivée\nRevenir en AP pour les caméras"
+                       if not getattr(app, "video_available", True) else "Geen camerabeeld")
+            self.cam.create_text(self.cam_w / 2, self.cam_h / 2, text=message,
+                                 fill=C["muted"], font=F["base"], width=self.cam_w - 16)
             return
         if vis is not None:
             img = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
@@ -857,6 +901,9 @@ class TelloGUI:
 
     # ================================================================ camera
     def set_camera_mode(self, use_downvision):
+        if not getattr(self.app, "vision_navigation_available", True):
+            self.toast.show(self.app.video_warning, "warn", 6)
+            return
         # Schakel tussen voor- en ondercamera via de mission queue.
         # via the mission thread: only one thread may talk to the Tello at a time
         self._cam_pending = bool(use_downvision)
@@ -866,10 +913,54 @@ class TelloGUI:
                             "opdracht.", "info")
 
     def toggle_record(self):
+        if not getattr(self.app, "vision_navigation_available", True):
+            self.toast.show(self.app.video_warning, "warn", 6)
+            return
         # Start of stop het verzamelen van cameraframes voor een dataset.
         self.app.toggle_recording()
         self.record_btn.configure(text="■ Stop opnemen" if self.app.recording
                                   else "● Opnemen (dataset)")
+
+    def _flip_availability(self):
+        app = self.app
+        if not getattr(app, "vision_navigation_available", True):
+            return False, "Salto · caméra indisponible", app.video_warning
+        telemetry = getattr(app, "telemetry", None)
+        battery = getattr(telemetry, "latest", {}).get("battery")
+        if battery is None:
+            battery = getattr(self, "_flip_battery", None)
+        pending = getattr(getattr(app, "commands", None), "flip_pending", None)
+        busy = (getattr(app, "_active_command", None) == "flip"
+                or (pending is not None and pending.is_set()))
+        return flip_readiness(app.state, app.airborne,
+                              getattr(app, "_motion_phase", None), battery, busy)
+
+    def _refresh_flip_button(self):
+        enabled, caption, warning = self._flip_availability()
+        self.flip_button.configure(state=tk.NORMAL if enabled else tk.DISABLED, text=caption,
+                                   fg=C["warn"] if warning else "white",
+                                   disabledforeground=C["muted"])
+
+    def _flip(self, direction="f"):
+        """Request a flip (salto). direction in 'f', 'b', 'l', 'r'."""
+        enabled, _, warning = self._flip_availability()
+        if not enabled:
+            self._refresh_flip_button()
+            self.toast.show(warning, "warn", 3)
+            return
+        dir_map = {"f": "f", "b": "b", "l": "l", "r": "r"}
+        d = dir_map.get(direction, "f")
+        # submit atomically captures coordinates + tracking validity here,
+        # before the mission worker has a chance to start the manoeuvre.
+        accepted = self.app.submit({"type": "flip", "dir": d})
+        self._refresh_flip_button()
+        if accepted is False:
+            self.toast.show("Salto niet ingepland. Wacht tot de drone gereed is.", "warn", 3)
+            return
+        text = "Salto aangevraagd"
+        if warning:
+            text += " · " + warning
+        self.toast.show(text, "warn" if warning else "info", 3 if warning else 2)
 
     # ============================================================= waypoints
     def _speed_changed(self, v):
@@ -1213,7 +1304,7 @@ class TelloGUI:
 
     def clear_trail(self):
         # Wis de grondkaart, het gevlogen pad en eerdere vluchten uit de weergave.
-        self.trail = []
+        self.trajectory.clear()
         self.flight_log.clear()
         self._next["path"] = 0
 
@@ -1262,7 +1353,7 @@ class TelloGUI:
             self.toast.show("Resetten kan alleen op de grond (eerst landen).", "warn")
             return
         self.app.submit({"type": "reset"})
-        self.trail = []
+        self.trajectory.clear()
         self._summary = None
         self.toast.show("Omgeving gereset: drone = (0, 0), x = richting van de neus.", "ok")
 
@@ -1384,6 +1475,9 @@ def main():
     parser.add_argument("--sim-model", action="store_true",
                         help="simulator only: use the trained puddle model instead of the "
                              "simulator's own puddle finder")
+    parser.add_argument("--connection", choices=("ap", "sta"), help="skip network dialog using AP or STA")
+    parser.add_argument("--host", help="drone IPv4 (STA DHCP address or direct AP address)")
+    parser.add_argument("--sta-video", action="store_true", help="probe STA video; requires real decoded frames")
     args = parser.parse_args()
 
     log = LogRedirect(sys.stdout)
@@ -1392,41 +1486,64 @@ def main():
     if args.scene and not args.sim:
         parser.error("--scene werkt alleen met --sim")
     root = tk.Tk()
-    puddle_model = None
-    if args.sim:
-        from drone import sim
-        if args.scene:
-            try:
-                sim.load_scene(args.scene)
-            except (OSError, ValueError) as e:   # also json.JSONDecodeError
-                parser.error(f"scène {args.scene}: {e}")
-        tello = sim.FakeTello(camera_turn_deg=cfg.CAM_ROTATE_DEG)
-        if not args.sim_model:
-            puddle_model = sim.SimPuddleModel()
-    else:
-        from djitellopy import Tello
-        Tello.RESPONSE_TIMEOUT = cfg.RESPONSE_TIMEOUT
-        # djitellopy binds its timeout as a default argument when the class is defined,
-        # so the line above alone changes nothing: long 'go' moves would time out after
-        # 7 s and be sent again. Set the default arguments themselves.
-        for name in ("send_control_command", "send_command_with_return"):
-            fn = getattr(Tello, name, None)
-            if fn is not None and fn.__defaults__:
-                fn.__defaults__ = (cfg.RESPONSE_TIMEOUT,) + fn.__defaults__[1:]
-        tello = Tello()
-
-    app = DroneApp(tello, record_dir=args.record, puddle_model=puddle_model)
+    root.withdraw()
+    app = None
+    mode = args.connection or "ap"
     try:
+        puddle_model = None
+        if args.sim:
+            from drone import sim
+            if args.scene:
+                try:
+                    sim.load_scene(args.scene)
+                except (OSError, ValueError) as e:   # also json.JSONDecodeError
+                    parser.error(f"scène {args.scene}: {e}")
+            tello = sim.FakeTello(camera_turn_deg=cfg.CAM_ROTATE_DEG)
+            if not args.sim_model:
+                puddle_model = sim.SimPuddleModel()
+        else:
+            # Provisioning/discovery must finish before djitellopy binds UDP 8889.
+            if args.connection:
+                host = args.host or (cfg.TELLO_AP_HOST if args.connection == "ap" else cfg.TELLO_STA_HOST)
+                options = ConnectionOptions(args.connection, host, args.sta_video)
+            else:
+                options = choose_connection(root)
+                if options is None:
+                    return
+            mode = options.mode
+            from drone.connection import ConfiguredTello
+            tello = ConfiguredTello(host=options.host, network_mode=options.mode,
+                                   probe_video=options.probe_video)
+        app = DroneApp(tello, record_dir=args.record, puddle_model=puddle_model)
         app.start()
+        root.deiconify()
+        TelloGUI(root, app, log, sim=args.sim)
+        root.mainloop()
+    except KeyboardInterrupt:
+        print("Verbinding afgebroken (Ctrl+C).")
     except Exception as e:
-        root.withdraw()
-        messagebox.showerror("Geen verbinding met de drone",
-                             f"{e}\n\nZit de laptop op de Wi-Fi van de Tello?\n"
-                             "Testen zonder drone: python tello_gui.py --sim")
-        app.link.close()
-        return
-    TelloGUI(root, app, log, sim=args.sim)
-    root.mainloop()
+        print(f"Opstarten mislukt: {e}")
+        help_text = ("STA : PC et drone sur le même réseau. Vérifier l'IP DHCP, le pare-feu UDP "
+                     "8889/8890 et l'isolation des clients.\n\n" + AP_RESET_HELP if mode == "sta" else
+                     "AP : connecter le PC au Wi-Fi TELLO du drone. Fermer les autres applications Tello.")
+        messagebox.showerror("Drone opstarten mislukt",
+                             f"{e}\n\n{help_text}\n\nTesten zonder drone: python tello_gui.py --sim",
+                             parent=root)
+    finally:
+        if app is not None:
+            # Closing the connection window must never issue a flight command.
+            app.running = False
+            app.abort.set()
+            if hasattr(app, "telemetry"):
+                app.telemetry.stop()
+            if hasattr(app, "odometry"):
+                app.odometry.stop()
+            app.link.close()
+        try:
+            root.destroy()
+        except tk.TclError:
+            pass
+        sys.stdout = log.original
 
 
 if __name__ == "__main__":

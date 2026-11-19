@@ -38,9 +38,10 @@ JETSON_PORT = 9001               # hier luistert de Jetson
 STATUS_INTERVAL = 1.0            # elke seconde een status-bericht
 ```
 
-* Met `JETSON_HOST = None` antwoordt de laptop aan wie het laatste commando stuurde, en neemt hij
-  van iedereen commando's aan. Zet het op het IP van de Jetson zodra je `LISTEN_HOST = "0.0.0.0"`
-  gebruikt.
+* Met `JETSON_HOST = None` neemt de laptop alleen commando's aan van zichzelf (`127.0.0.1`,
+  bv. `fake_jetson.py`), zodat niemand anders op het netwerk de drone kan laten opstijgen. Een
+  echte Jetson wordt dan genegeerd (log: *Bericht van … genegeerd*): zet `JETSON_HOST` dus op het
+  IP van de Jetson zodra je `LISTEN_HOST = "0.0.0.0"` gebruikt.
 * Laat op Windows de firewall **inkomend UDP 9000** toe voor Python.
 * Berichten gaan pas naar de Jetson als de laptop weet waar die zit: na het eerste commando van de
   Jetson, of meteen als `JETSON_HOST` is ingesteld. Stuur dus eerst een `ping`.
@@ -136,7 +137,14 @@ Alles hierboven werkt ook met de simulator: start op de laptop
 `python tello_gui.py --sim --scene sim_scenes/pad_met_plassen.json` en stuur vanaf de Jetson
 `python stuur.py pad`. De gesimuleerde drone volgt de tape, vindt de drie plassen en stuurt ze naar
 de Jetson. Op één computer kan het ook: laat `LISTEN_HOST` op `127.0.0.1` en gebruik
-`LAPTOP = ("127.0.0.1", 9000)`.
+`LAPTOP = ("127.0.0.1", 9000)`, of gebruik `fake_jetson.py` als nep-Jetson:
+
+```bash
+python fake_jetson.py listen                                # toon elk bericht van de laptop
+python fake_jetson.py ping                                  # één ping, wacht op de pong
+python fake_jetson.py mission json_flights/mission_example.json
+python fake_jetson.py abort                                 # Abort = landen
+```
 
 ## Problemen
 
