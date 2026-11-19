@@ -1396,7 +1396,10 @@ def main():
     if args.sim:
         from drone import sim
         if args.scene:
-            sim.load_scene(args.scene)
+            try:
+                sim.load_scene(args.scene)
+            except (OSError, ValueError) as e:   # also json.JSONDecodeError
+                parser.error(f"scène {args.scene}: {e}")
         tello = sim.FakeTello(camera_turn_deg=cfg.CAM_ROTATE_DEG)
         if not args.sim_model:
             puddle_model = sim.SimPuddleModel()

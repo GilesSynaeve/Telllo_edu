@@ -623,7 +623,12 @@ y = links. Elke sleutel is optioneel: wat ontbreekt blijft zoals in `drone/sim.p
   grijswaarde (0 = zwart, de vloer is ~150).
 * `puddles`: `[x, y, lengte, breedte, draaiing in graden]`, of `[x, y, diameter]`, of
   `{"x": .., "y": .., "l": .., "w": .., "rot": ..}`.
-* `helipad`: `[x, y, papier, H, draaiing]`, `terrain`: `[x0, x1, y0, y1, hoogte]` per doos.
+* `helipad`: één H als `[x, y, papier, H, draaiing]` (of kort `[x, y]`: papier 42, H 26, niet
+  gedraaid), meer H's als lijst van lijsten `[[x, y, ...], [x, y, ...]]`, of `null` voor geen H.
+* `terrain`: `[x0, x1, y0, y1, hoogte]` per doos.
+
+Klopt er iets niet in het bestand, dan zegt de GUI bij het starten welke sleutel en welk object
+fout zijn, in plaats van te crashen.
 
 Leg een plas niet te ver naast het pad: op ~95 cm hoogte ziet de camera maar ongeveer 40 cm
 links en rechts. Een plas die alleen half in beeld komt, telt niet (zijn midden is niet te
